@@ -1,0 +1,12 @@
+[package]
+name = "JPlayer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+winit = { version = "0.30.0" }
+wgpu = "29.0.1"
+pollster = "0.4.0"
+anyhow = "1.0.102"
+log = "0.4.29"
+ffmpeg-sys-next = "8.1.0"
