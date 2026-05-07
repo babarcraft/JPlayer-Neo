@@ -1,9 +1,10 @@
-use wgpu::{Color, Operations, RenderPassColorAttachment, RenderPassDescriptor, StoreOp, TextureView};
+use wgpu::{Color, Face, FragmentState, FrontFace, MultisampleState, Operations, PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology, RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, StoreOp, TextureView, VertexState};
 use wgpu::LoadOp::Clear;
 use wgpu::wgt::CommandEncoderDescriptor;
 use crate::window::app::{AppContext, Scene, State};
 
 pub mod window;
+pub mod ffmpeg;
 
 struct PlayerScene {
     render_pipeline: Option<wgpu::RenderPipeline>,
@@ -19,6 +20,44 @@ impl PlayerScene {
 
 impl Scene for PlayerScene {
     fn init(&mut self, state: &mut State, app: &mut AppContext) {
+        let shader = state.device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Simple rendering shader"),
+            source: ShaderSource::Wgsl(include_str!("res/render.wgsl").into()),
+        });
+        let pipeline_layout = state.device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Simple rendering pipeline layout"),
+            bind_group_layouts: &[],
+            immediate_size: 0
+        });
+        let render_pipeline = state.device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Simple rendering pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vertex_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[]
+            },
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: Some(Face::Back),
+                unclipped_depth: false,
+                polygon_mode: PolygonMode::Fill,
+                conservative: false
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fragment_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[]
+            }),
+            multiview_mask: None,
+            cache: None
+        });
     }
 
     fn render(&mut self, state: &mut State, app: &mut AppContext, view: &TextureView) {
