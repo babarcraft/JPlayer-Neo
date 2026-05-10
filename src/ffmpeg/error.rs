@@ -1,6 +1,7 @@
 use std::ffi::{c_char, CStr};
 use ffmpeg_sys_next::{av_make_error_string, av_strerror};
 
+#[derive(Debug)]
 pub struct Error {
     message: String,
     code: i32,

@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use wgpu::{Color, Face, FragmentState, FrontFace, MultisampleState, Operations, PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology, RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, StoreOp, TextureView, VertexState};
 use wgpu::LoadOp::Clear;
 use wgpu::wgt::CommandEncoderDescriptor;
+use crate::ffmpeg::input::Input;
 use crate::window::app::{AppContext, Scene, State};
 
 pub mod window;
@@ -88,6 +90,15 @@ impl Scene for PlayerScene {
 }
 
 fn main() {
+    let mut input = Input::open("test.mp4", HashMap::new()).unwrap();
+    for _ in 0..100 {
+        let packet = input.read_packet().unwrap();
+        if packet.stream_index() != 0 {
+            continue;
+        }
+        println!("Pts : {}", packet.pts())
+    }
+
     let mut app = window::app::App::new();
     app.app_context.set_scene(Box::new(PlayerScene::new()));
     app.run().unwrap();
