@@ -1,6 +1,6 @@
 use crate::ffmpeg;
 use crate::ffmpeg::error::Error;
-use ffmpeg_sys_next::{av_dict_set, av_q2d, av_read_frame, avcodec_parameters_alloc, avcodec_parameters_copy, avcodec_parameters_free, AVCodecParameters, AVRational, AVStream};
+use ffmpeg_sys_next::{av_dict_set, av_q2d, av_read_frame, avcodec_parameters_alloc, avcodec_parameters_copy, avcodec_parameters_free, avformat_find_stream_info, AVCodecParameters, AVMediaType, AVRational, AVStream};
 use ffmpeg_sys_next::avformat_alloc_context;
 use ffmpeg_sys_next::avformat_close_input;
 use ffmpeg_sys_next::avformat_open_input;
@@ -15,10 +15,29 @@ use crate::ffmpeg::packet::Packet;
 
 static INPUT_ID: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Clone)]
+pub enum StreamType {
+    Video, Audio, Data, Other
+}
+
+impl TryFrom<AVMediaType> for StreamType {
+    type Error = ();
+
+    fn try_from(value: AVMediaType) -> Result<Self, Self::Error> {
+        match value {
+            AVMediaType::AVMEDIA_TYPE_VIDEO => Ok(StreamType::Video),
+            AVMediaType::AVMEDIA_TYPE_AUDIO => Ok(StreamType::Audio),
+            AVMediaType::AVMEDIA_TYPE_DATA => Ok(StreamType::Data),
+            _ => Err(())
+        }
+    }
+}
+
 pub struct Stream {
     pub timebase: f64,
     pub start_time: f64,
     pub index: i32,
+    pub stream_type: StreamType,
     pub parameters: *mut AVCodecParameters
 }
 
@@ -35,6 +54,7 @@ impl Stream {
                 timebase,
                 start_time: (*other).start_time as f64 * timebase,
                 index: (*other).index,
+                stream_type: StreamType::try_from((*((*other).codecpar)).codec_type).unwrap(),
                 parameters
             }
         }
@@ -61,6 +81,7 @@ impl Clone for Stream {
                 timebase: self.timebase,
                 start_time: self.start_time,
                 index: self.index,
+                stream_type: self.stream_type.clone(),
                 parameters
             }
         }
@@ -92,6 +113,11 @@ impl Input {
                 std::ptr::null(),
                 &mut options_dict as *mut *mut AVDictionary
             );
+            if result < 0 {
+                return Err(Error::from_code(result));
+            }
+            
+            let result = avformat_find_stream_info(context, &mut options_dict);
             if result < 0 {
                 return Err(Error::from_code(result));
             }
