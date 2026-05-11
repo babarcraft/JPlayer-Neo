@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use wgpu::{Color, Face, FragmentState, FrontFace, MultisampleState, Operations, PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology, RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, StoreOp, TextureView, VertexState};
 use wgpu::LoadOp::Clear;
 use wgpu::wgt::CommandEncoderDescriptor;
-use crate::ffmpeg::input::Input;
+use crate::ffmpeg::decode::{Decoder, DecoderResult};
+use crate::ffmpeg::frame::Frame;
+use crate::ffmpeg::input::{Input, StreamType};
 use crate::window::app::{AppContext, Scene, State};
 
 pub mod window;
@@ -91,12 +93,29 @@ impl Scene for PlayerScene {
 
 fn main() {
     let mut input = Input::open("test.mp4", vec![]).unwrap();
-    for _ in 0..100 {
-        let packet = input.read_packet().unwrap();
-        if packet.stream_index() != 0 {
+    let stream = input.streams.iter().find(|stream| stream.stream_type == StreamType::Video).unwrap().clone();
+    let mut decoder = Decoder::new(stream.clone(), vec![]).unwrap();
+    let mut frame = Frame::new();
+    while let Ok(packet) = input.read_packet() {
+        if packet.stream_index() != stream.index {
             continue;
         }
-        println!("Pts : {}", packet.pts())
+        loop {
+            let result = decoder.receive_frame(&mut frame);
+            match result {
+                DecoderResult::NeedsInput => {
+                    decoder.send_packet(packet.clone()).unwrap();
+                    break
+                }
+                DecoderResult::Error(error) => {
+                    panic!("Error decoding: {:?}", error);
+                }
+                DecoderResult::FrameReceived => {
+                    println!("Frame received: {} s", frame.pts.unwrap());
+                }
+            }
+        }
+        frame.unref();
     }
 
     let mut app = window::app::App::new();

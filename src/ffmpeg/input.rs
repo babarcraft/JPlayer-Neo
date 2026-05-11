@@ -16,7 +16,7 @@ use crate::ffmpeg::utils::convert_options;
 
 static INPUT_ID: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum StreamType {
     Video, Audio, Data, Other
 }

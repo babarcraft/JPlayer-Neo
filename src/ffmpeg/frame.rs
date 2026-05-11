@@ -1,4 +1,4 @@
-use ffmpeg_sys_next::{av_frame_alloc, avcodec_receive_frame, AVCodecContext, AVFrame, AVERROR, EAGAIN, EOF};
+use ffmpeg_sys_next::{av_frame_alloc, av_frame_clone, av_frame_free, av_frame_unref, avcodec_receive_frame, AVCodecContext, AVFrame, AVERROR, EAGAIN, EOF};
 use crate::ffmpeg::decode::DecoderResult;
 use crate::ffmpeg::error::Error;
 use crate::ffmpeg::input::Stream;
@@ -38,6 +38,33 @@ impl Frame {
                 
                 DecoderResult::FrameReceived
             }
+        }
+    }
+
+    pub fn unref(&mut self) {
+        unsafe {
+            av_frame_unref(self.pointer);
+        }
+    }
+}
+
+impl Clone for Frame {
+    fn clone(&self) -> Self {
+        unsafe {
+            let frame = av_frame_clone(self.pointer);
+            Self {
+                pointer: frame,
+                serial: self.serial,
+                pts: self.pts,
+            }
+        }
+    }
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        unsafe {
+            av_frame_free(&mut self.pointer);
         }
     }
 }
