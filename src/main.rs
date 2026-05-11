@@ -90,7 +90,7 @@ impl Scene for PlayerScene {
 }
 
 fn main() {
-    let mut input = Input::open("test.mp4", HashMap::new()).unwrap();
+    let mut input = Input::open("test.mp4", vec![]).unwrap();
     for _ in 0..100 {
         let packet = input.read_packet().unwrap();
         if packet.stream_index() != 0 {

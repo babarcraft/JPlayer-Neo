@@ -2,7 +2,7 @@ use ffmpeg_sys_next::{av_packet_clone, av_read_frame, AVFormatContext, AVPacket}
 use crate::ffmpeg::error::Error;
 
 pub struct Packet {
-    pointer: *mut AVPacket,
+    pub(super) pointer: *mut AVPacket,
     pub serial: u32,
     pub id: usize
 }

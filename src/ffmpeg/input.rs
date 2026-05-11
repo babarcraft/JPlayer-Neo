@@ -12,6 +12,7 @@ use std::ffi::CString;
 use std::str::FromStr;
 use std::sync::atomic::AtomicUsize;
 use crate::ffmpeg::packet::Packet;
+use crate::ffmpeg::utils::convert_options;
 
 static INPUT_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -96,28 +97,21 @@ pub struct Input {
 }
 
 impl Input {
-    pub fn open(path: &str, options: HashMap<String, String>) -> Result<Self, Error> {
+    pub fn open(path: &str, options: Vec<(&str, &str)>) -> Result<Self, Error> {
         unsafe {
             let mut context = avformat_alloc_context();
-            let mut options_dict: *mut AVDictionary = std::ptr::null_mut();
-
-            for (key, value) in options.iter()
-                .map(|(key, value)| (CString::from_str(key.as_str()).unwrap(), CString::from_str(value.as_str()).unwrap())) {
-                av_dict_set(&mut options_dict as *mut *mut AVDictionary, key.as_ptr(), value.as_ptr(), 0);
-            }
-
             let path_str = CString::from_str(path).unwrap();
             let result = avformat_open_input(
                 &mut context as *mut *mut AVFormatContext,
                 path_str.as_ptr(),
                 std::ptr::null(),
-                &mut options_dict as *mut *mut AVDictionary
+                &mut convert_options(options),
             );
             if result < 0 {
                 return Err(Error::from_code(result));
             }
             
-            let result = avformat_find_stream_info(context, &mut options_dict);
+            let result = avformat_find_stream_info(context, std::ptr::null_mut());
             if result < 0 {
                 return Err(Error::from_code(result));
             }
