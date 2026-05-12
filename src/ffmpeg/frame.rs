@@ -50,7 +50,7 @@ impl Frame {
         }
     }
 
-    pub fn transfer_hw_data_to(&mut self, other: &mut Frame, stream: &Stream) -> Result<(), Error> {
+    pub fn transfer_hw_data_to(&self, other: &mut Frame, stream: &Stream) -> Result<(), Error> {
         unsafe {
             let result = av_hwframe_transfer_data(other.pointer, self.pointer, 0);
             if result < 0 {
@@ -60,7 +60,6 @@ impl Frame {
             if result < 0 {
                 return Err(Error::from_code(result))
             }
-            self.unref();
             other.update_data(other.serial, stream);
             Ok(())
         }

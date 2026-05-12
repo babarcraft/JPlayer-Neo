@@ -18,7 +18,6 @@ pub enum DecoderResult {
 pub struct Decoder {
     context: *mut AVCodecContext,
     preferred_pix_format: Box<AVPixelFormat>,
-    hardware_frame: Option<Frame>,
     pub serial: Option<u32>,
     pub stream: Stream,
 }
@@ -72,7 +71,6 @@ impl Decoder {
             }
 
             let mut preferred_pix_format = Box::new(AVPixelFormat::AV_PIX_FMT_NONE);
-            let mut hardware_download_frame: Option<Frame> = None;
 
             if let Some((device_type, pixel_format)) = get_hardware_pix_format(codec) {
                 let mut device_context: *mut AVBufferRef = std::ptr::null_mut();
@@ -84,7 +82,6 @@ impl Decoder {
                     (*context).get_format = Some(get_format_callback);
                     (*context).hw_device_ctx = device_context;
                     (*context).opaque = preferred_pix_format.as_mut() as *mut _ as *mut c_void;
-                    hardware_download_frame = Some(Frame::new());
                 }
             }
 
@@ -97,28 +94,13 @@ impl Decoder {
                 context,
                 serial: None,
                 preferred_pix_format,
-                hardware_frame: hardware_download_frame,
                 stream,
             })
         }
     }
 
     pub fn receive_frame(&mut self, frame: &mut Frame) -> DecoderResult {
-        if let Some(hardware_frame) = &mut self.hardware_frame {
-            match hardware_frame.receive_frame_from_decoder(self.serial, &self.stream, self.context) {
-                DecoderResult::FrameReceived => {
-                    if let Err(error) = hardware_frame.transfer_hw_data_to(frame, &self.stream) {
-                        DecoderResult::Error(error)
-                    } else {
-                        DecoderResult::FrameReceived
-                    }
-                }
-                DecoderResult::NeedsInput => DecoderResult::NeedsInput,
-                DecoderResult::Error(error) => DecoderResult::Error(error),
-            }
-        } else {
-            frame.receive_frame_from_decoder(self.serial, &self.stream, self.context)
-        }
+        frame.receive_frame_from_decoder(self.serial, &self.stream, self.context)
     }
 
     pub fn send_packet(&mut self, packet: Packet) -> Result<(), Error> {

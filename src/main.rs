@@ -1,14 +1,16 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::ops::{Add, Range};
+use std::time::{Duration, Instant, SystemTime};
 use ffmpeg_sys_next::{avformat_receive_command_reply, daylight};
 use wgpu::{BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BlendState, BufferAddress, BufferUsages, Color, ColorTargetState, ColorWrites, Extent3d, Face, FragmentState, FrontFace, IndexFormat, MultisampleState, Operations, Origin3d, PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology, RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor, Sampler, SamplerBindingType, ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect, TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDimension, VertexState};
+use wgpu::hal::vulkan::conv::map_vk_surface_formats;
 use wgpu::LoadOp::Clear;
 use wgpu::util::{BufferInitDescriptor, RenderEncoder};
 use wgpu::wgc::command::RenderPassErrorInner::Bind;
 use wgpu::wgt::{BufferDescriptor, CommandEncoderDescriptor, SamplerDescriptor, TextureDescriptor};
 use crate::ffmpeg::decode::{Decoder, DecoderResult};
 use crate::ffmpeg::frame::Frame;
-use crate::ffmpeg::input::{Input, StreamType};
+use crate::ffmpeg::input::{Input, Stream, StreamType};
 use crate::window::app::{AppContext, Scene, State};
 
 pub mod window;
@@ -18,7 +20,8 @@ struct VideoSurface {
     texture: Texture,
     view: TextureView,
     sampler: Sampler,
-    bind_group: BindGroup
+    bind_group: BindGroup,
+    frame: Frame,
 }
 
 struct PlayerScene {
@@ -27,8 +30,11 @@ struct PlayerScene {
     vertex_buffer: Option<wgpu::Buffer>,
     index_buffer: Option<wgpu::Buffer>,
     video_surface: Option<VideoSurface>,
-    frame_channel: std::sync::mpsc::Receiver<Frame>,
+    begin_time: Instant,
+    frame_channel: std::sync::mpsc::Receiver<(Range<f64>, Frame)>,
+    video_stream: Option<Stream>,
     video_thread: std::thread::JoinHandle<()>,
+    current_frame: Option<(Range<f64>, Frame)>,
 }
 
 #[repr(C)]
@@ -42,7 +48,7 @@ impl Vertex {
     fn desc() -> wgpu::VertexBufferLayout<'static> {
         use std::mem;
         wgpu::VertexBufferLayout {
-            array_stride: mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            array_stride: size_of::<Vertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
                 wgpu::VertexAttribute {
@@ -62,10 +68,12 @@ impl Vertex {
 
 impl PlayerScene {
     fn new() -> Self {
-        let (sender, receiver) = std::sync::mpsc::channel::<Frame>();
+        let mut begin_time = SystemTime::now();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(3);
+        let mut input = Input::open("test.mp4", vec![]).unwrap();
+        let stream = input.streams.iter().find(|stream| stream.stream_type == StreamType::Video).unwrap().clone();
+        let stream_clone = stream.clone();
         let thread = std::thread::spawn(move || {
-            let mut input = Input::open("test.mp4", vec![]).unwrap();
-            let stream = input.streams.iter().find(|stream| stream.stream_type == StreamType::Video).unwrap().clone();
             let mut decoder = Decoder::new(stream.clone(), vec![]).unwrap();
             let mut frame = Frame::new();
             while let Ok(packet) = input.read_packet() {
@@ -83,12 +91,13 @@ impl PlayerScene {
                             panic!("Error decoding: {:?}", error);
                         }
                         DecoderResult::FrameReceived => {
-                            sender.send(frame.clone()).unwrap();
-                            std::thread::sleep(Duration::from_secs_f64(frame.duration.unwrap()))
+                            let start = frame.pts.unwrap();
+                            let end = start + frame.duration.unwrap();
+                            sender.send((start..end, frame.clone())).unwrap();
+                            frame.unref();
                         }
                     }
                 }
-                frame.unref();
             }
         });
         Self {
@@ -99,6 +108,9 @@ impl PlayerScene {
             surface_bind_group_layout: None,
             vertex_buffer: None,
             index_buffer: None,
+            video_stream: Some(stream_clone),
+            begin_time: Instant::now(),
+            current_frame: None,
         }
     }
 }
@@ -150,12 +162,17 @@ impl PlayerScene {
                 texture,
                 view,
                 sampler,
-                bind_group
+                bind_group,
+                frame: Frame::new(),
             })
         }
 
+        let surface = self.video_surface.as_mut().unwrap();
+        frame.transfer_hw_data_to(&mut surface.frame, self.video_stream.as_ref().unwrap()).unwrap();
+        let frame = &surface.frame;
+
         state.queue.write_texture(TexelCopyTextureInfo {
-            texture: &self.video_surface.as_mut().unwrap().texture,
+            texture: &surface.texture,
             mip_level: 0,
             origin: Origin3d::ZERO,
             aspect: TextureAspect::All,
@@ -289,8 +306,20 @@ impl Scene for PlayerScene {
                 multiview_mask: None
             });
 
-            if let Some(frame) = self.frame_channel.try_recv().ok() {
-                self.upload_frame(state, &frame);
+            if self.current_frame.is_none() {
+                if let Some((time_range, frame)) = self.frame_channel.try_recv().ok() {
+                    self.current_frame = Some((time_range, frame));
+                }
+            }
+            if let Some((time_range, frame)) = self.current_frame.take() {
+                let current = self.begin_time.elapsed().as_secs_f64();
+                if current < time_range.start {
+                    self.current_frame = Some((time_range, frame));
+                } else if current > time_range.end {
+                } else {
+                    self.upload_frame(state, &frame);
+                    self.current_frame = Some((time_range, frame));
+                }
             }
 
             if let Some(video_surface) = self.video_surface.as_ref() {

@@ -42,6 +42,8 @@ pub struct Stream {
     pub parameters: *mut AVCodecParameters
 }
 
+unsafe impl Send for Stream {}
+
 impl Stream {
     fn from_stream(other: *const AVStream) -> Self {
         unsafe {
@@ -95,6 +97,8 @@ pub struct Input {
     pub serial: u32,
     pub id: usize
 }
+
+unsafe impl Send for Input {}
 
 impl Input {
     pub fn open(path: &str, options: Vec<(&str, &str)>) -> Result<Self, Error> {
