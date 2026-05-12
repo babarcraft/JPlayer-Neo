@@ -10,6 +10,8 @@ pub struct Frame {
     pub duration: Option<f64>,
 }
 
+unsafe impl Send for Frame {}
+
 impl Frame {
     pub fn new() -> Self {
         unsafe {
@@ -64,9 +66,27 @@ impl Frame {
         }
     }
 
-    pub fn pixel_format(&mut self) -> Option<AVPixelFormat> {
+    pub fn pixel_format(&self) -> Option<AVPixelFormat> {
         unsafe {
             std::mem::transmute((*self.pointer).format)
+        }
+    }
+    
+    pub fn dimensions(&self) -> (usize, usize) {
+        unsafe {
+            ((*self.pointer).width as usize, (*self.pointer).height as usize)
+        }
+    }
+    
+    pub fn width(&self) -> usize { 
+        unsafe {
+            (*self.pointer).width as usize
+        }
+    }
+    
+    pub fn height(&self) -> usize {
+        unsafe {
+            (*self.pointer).height as usize
         }
     }
 
@@ -79,6 +99,12 @@ impl Frame {
             }
             let height = (*self.pointer).height as usize;
             std::slice::from_raw_parts(data, line_size * height)
+        }
+    }
+    
+    pub fn plane_stride(&self, num: usize) -> usize {
+        unsafe {
+            (*self.pointer).linesize[num] as usize
         }
     }
 

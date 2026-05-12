@@ -165,7 +165,12 @@ impl ApplicationHandler for App {
             .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0));
         let window = Arc::new(event_loop.create_window(attributes).unwrap());
         self.window = Some(window.clone());
-        self.state = Some(pollster::block_on(State::new(window)).unwrap());
+        let mut state = pollster::block_on(State::new(window)).unwrap();
+        if let Some(mut scene) = self.app_context.scene.take() {
+            scene.init(&mut state, &mut self.app_context);
+            self.app_context.scene = Some(scene);
+        }
+        self.state = Some(state);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
