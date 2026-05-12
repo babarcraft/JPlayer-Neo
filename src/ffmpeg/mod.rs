@@ -5,4 +5,3 @@ pub mod packet;
 pub mod frame;
 pub mod error;
 pub mod utils;
-pub mod hardware;

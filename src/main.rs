@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 use wgpu::{Color, Face, FragmentState, FrontFace, MultisampleState, Operations, PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology, RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, StoreOp, TextureView, VertexState};
 use wgpu::LoadOp::Clear;
 use wgpu::wgt::CommandEncoderDescriptor;
@@ -111,7 +112,11 @@ fn main() {
                     panic!("Error decoding: {:?}", error);
                 }
                 DecoderResult::FrameReceived => {
-                    println!("Frame received: {} s", frame.pts.unwrap());
+                    println!("Frame received: {} s , pixel format {:?}", frame.pts.unwrap(), frame.pixel_format());
+                    let plane_y = frame.plane(0);
+                    let plane_uv = frame.plane(2);
+                    println!("Planes : [u8; {}] , [u8; {}]", plane_y.len(), plane_uv.len());
+                    std::thread::sleep(Duration::from_secs_f64(frame.duration.unwrap()))
                 }
             }
         }
