@@ -5,13 +5,14 @@ struct Params {
     height: u32,
 };
 
-@group(0) @binding(0) var<storage, read> y_buffer: array<u32>;
-@group(0) @binding(1) var<storage, read> uv_buffer: array<u32>;
-@group(0) @binding(2) var out_tex: texture_storage_2d<rgba8unorm, write>;
+@group(1) @binding(0) var<storage, read> y_buffer: array<u32>;
+@group(1) @binding(1) var<storage, read> uv_buffer: array<u32>;
 
-@group(0) @binding(3) var<uniform> color_space: mat3x3<f32>;
-@group(0) @binding(4) var<uniform> color_offset: vec3<f32>;
-@group(0) @binding(5) var<uniform> params: Params;
+@group(0) @binding(0) var out_tex: texture_storage_2d<rgba8unorm, write>;
+
+@group(0) @binding(1) var<uniform> color_space: mat3x3<f32>;
+@group(0) @binding(2) var<uniform> color_offset: vec3<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
 
 // Instead of passing the buffer, we pass the packed U32 value
 // and the byte index within that specific U32.

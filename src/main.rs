@@ -29,6 +29,8 @@ enum RingBufferState {
 
 struct RingBuffer {
     buffers: Vec<RingBufferState>,
+    layout: BindGroupLayout,
+    bind_groups: Vec<Option<BindGroup>>,
     plane_sizes: Vec<usize>,
     size: usize,
     read: usize,
@@ -82,7 +84,7 @@ impl RingBuffer {
             buffers.push(state.device.create_buffer(&BufferDescriptor {
                 label: None,
                 size: *size as BufferAddress,
-                usage: BufferUsages::MAP_WRITE | BufferUsages::COPY_SRC,
+                usage: BufferUsages::MAP_WRITE | BufferUsages::STORAGE,
                 mapped_at_creation: false
             }));
         }
@@ -90,15 +92,20 @@ impl RingBuffer {
     }
 
     fn new(state: &mut State, capacity: usize, plane_sizes: &[usize]) -> RingBuffer {
+        let layout = Self::create_bind_group_layout(state, plane_sizes);
         let mut buffers = Vec::new();
+        let mut bind_groups = Vec::new();
         for _ in 0..capacity {
             let current_buffers = Self::allocate_buffers(state, plane_sizes);
+            bind_groups.push(Some(Self::create_bind_group(state, &current_buffers, &layout, plane_sizes)));
             buffers.push(RingBufferState::Unmapped(current_buffers));
         }
 
         RingBuffer {
             buffers,
             plane_sizes: plane_sizes.to_vec(),
+            bind_groups,
+            layout,
             size: 0,
             read: 0,
             write: 0,
@@ -107,11 +114,14 @@ impl RingBuffer {
 
     fn reallocate(&mut self, state: &mut State, plane_sizes: &[usize]) {
         let mut buffers = Vec::new();
+        let mut bind_groups = Vec::new();
         for _ in 0..self.buffers.len() {
             let current_buffers = Self::allocate_buffers(state, plane_sizes);
+            bind_groups.push(Some(Self::create_bind_group(state, &current_buffers, &self.layout, plane_sizes)));
             buffers.push(RingBufferState::Unmapped(current_buffers));
         }
         self.buffers = buffers;
+        self.bind_groups = bind_groups;
         self.plane_sizes = plane_sizes.to_vec();
         self.size = 0;
         self.read = 0;
@@ -192,7 +202,7 @@ impl RingBuffer {
         self.size = self.size + 1;
     }
 
-    fn get_read(&mut self) -> Option<Vec<Buffer>> {
+    fn get_read(&mut self) -> Option<(Vec<Buffer>, BindGroup)> {
         if self.size <= 0 {
             return None;
         }
@@ -203,14 +213,15 @@ impl RingBuffer {
                 buffer.unmap()
             }
             self.buffers[self.read] = RingBufferState::MappedReading;
-            return Some(buffers);
+            return Some((buffers, self.bind_groups[self.read].take().unwrap()));
         }
         self.buffers[self.read] = current;
         None
     }
 
-    fn commit_read(&mut self, buffer: Vec<Buffer>) {
+    fn commit_read(&mut self, buffer: Vec<Buffer>, bind_group: BindGroup) {
         self.buffers[self.read] = RingBufferState::Unmapped(buffer);
+        self.bind_groups[self.read] = Some(bind_group);
         self.read = (self.read + 1) % self.buffers.len();
         self.size = self.size - 1;
     }
@@ -230,8 +241,6 @@ struct NV12Converter {
     bind_group: BindGroup,
     output_texture: Texture,
     buffer: RingBuffer,
-    y_buffer: Buffer,
-    uv_buffer: Buffer,
     color_space_buffer: Buffer,
     color_offset_buffer: Buffer,
     params_buffer: Buffer,
@@ -247,26 +256,6 @@ impl NV12Converter {
                 BindGroupLayoutEntry {
                     binding: 0,
                     visibility: ShaderStages::COMPUTE,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: ShaderStages::COMPUTE,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: ShaderStages::COMPUTE,
                     ty: BindingType::StorageTexture {
                         view_dimension: TextureViewDimension::D2,
                         access: StorageTextureAccess::WriteOnly,
@@ -275,27 +264,27 @@ impl NV12Converter {
                     count: None,
                 },
                 BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
                     binding: 3,
-                    visibility: ShaderStages::COMPUTE,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: ShaderStages::COMPUTE,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 5,
                     visibility: ShaderStages::COMPUTE,
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Uniform,
@@ -330,18 +319,6 @@ impl NV12Converter {
             usage: BufferUsages::COPY_DST | BufferUsages::UNIFORM,
             mapped_at_creation: false,
         });
-        let y_buffer = state.device.create_buffer(&BufferDescriptor {
-            label: Some("NV12 to RGBA color info buffer"),
-            size: strides[0] as BufferAddress * height as BufferAddress,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let uv_buffer = state.device.create_buffer(&BufferDescriptor {
-            label: Some("NV12 to RGBA color info buffer"),
-            size: strides[0] as BufferAddress * (height / 2) as BufferAddress,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
 
         let output_texture = state.create_simple_2d_texture(
             width,
@@ -353,6 +330,7 @@ impl NV12Converter {
             label: Some("NV12 to RGBA layout"),
             bind_group_layouts: &[
                 Some(&bindgroup_layout),
+                Some(&buffer.layout),
             ],
             immediate_size: 0
         });
@@ -363,26 +341,18 @@ impl NV12Converter {
             entries: &[
                 BindGroupEntry {
                     binding: 0,
-                    resource: y_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: uv_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 2,
                     resource: BindingResource::TextureView(&output_texture.create_view(&TextureViewDescriptor::default()))
                 },
                 BindGroupEntry {
-                    binding: 3,
+                    binding: 1,
                     resource: color_space_buffer.as_entire_binding(),
                 },
                 BindGroupEntry {
-                    binding: 4,
+                    binding: 2,
                     resource: color_offset_buffer.as_entire_binding(),
                 },
                 BindGroupEntry {
-                    binding: 5,
+                    binding: 3,
                     resource: params_buffer.as_entire_binding(),
                 }
             ]
@@ -407,8 +377,6 @@ impl NV12Converter {
             bind_group,
             output_texture,
             buffer,
-            y_buffer,
-            uv_buffer,
             width,
             height,
             color_offset_buffer,
@@ -439,21 +407,20 @@ impl NV12Converter {
             self.buffer.commit_write(buffers);
         }
 
-        if let Some(buffers) = self.buffer.get_read() {
-            encoder.copy_buffer_to_buffer(&buffers[0], 0, &self.y_buffer, 0, Some(frame.plane_stride(0) as BufferAddress * self.height as BufferAddress));
-            encoder.copy_buffer_to_buffer(&buffers[1], 0, &self.uv_buffer, 0, Some(frame.plane_stride(1) as BufferAddress * (self.height / 2) as BufferAddress));
+        if let Some((buffers, bind_group)) = self.buffer.get_read() {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: None,
                 timestamp_writes: None
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(1, &bind_group, &[]);
             pass.dispatch_workgroups(
                 (self.width + 7) / 8,
                 (self.height + 7) / 8,
                 1
             );
-            self.buffer.commit_read(buffers);
+            self.buffer.commit_read(buffers, bind_group);
         }
     }
 }

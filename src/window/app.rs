@@ -45,7 +45,7 @@ impl State {
 
         let (device, queue) = adapter.request_device(&DeviceDescriptor {
             label: None,
-            required_features: wgpu::Features::empty(),
+            required_features: wgpu::Features::MAPPABLE_PRIMARY_BUFFERS,
             required_limits: wgpu::Limits::default(),
             experimental_features: ExperimentalFeatures::disabled(),
             memory_hints: MemoryHints::default(),
