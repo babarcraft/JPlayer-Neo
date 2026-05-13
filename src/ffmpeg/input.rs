@@ -1,6 +1,6 @@
 use crate::ffmpeg;
 use crate::ffmpeg::error::Error;
-use ffmpeg_sys_next::{av_dict_set, av_q2d, av_read_frame, avcodec_parameters_alloc, avcodec_parameters_copy, avcodec_parameters_free, avformat_find_stream_info, AVCodecParameters, AVMediaType, AVRational, AVStream};
+use ffmpeg_sys_next::{av_dict_set, av_dump_format, av_q2d, av_read_frame, avcodec_parameters_alloc, avcodec_parameters_copy, avcodec_parameters_free, avformat_find_stream_info, AVCodecParameters, AVMediaType, AVRational, AVStream};
 use ffmpeg_sys_next::avformat_alloc_context;
 use ffmpeg_sys_next::avformat_close_input;
 use ffmpeg_sys_next::avformat_open_input;
@@ -9,6 +9,7 @@ use ffmpeg_sys_next::AVFormatContext;
 use ffmpeg_sys_next::AVPacket;
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::ptr::null;
 use std::str::FromStr;
 use std::sync::atomic::AtomicUsize;
 use crate::ffmpeg::packet::Packet;
@@ -119,6 +120,8 @@ impl Input {
             if result < 0 {
                 return Err(Error::from_code(result));
             }
+
+            av_dump_format(context, 0, null(), 0);
 
             let streams = std::slice::from_raw_parts((*context).streams, (*context).nb_streams as usize)
                 .iter().map(|stream| Stream::from_stream(*stream)).collect();

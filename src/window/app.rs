@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use ffmpeg_sys_next::AVPixelFormat::{AV_PIX_FMT_RGB24, AV_PIX_FMT_YUV420P};
-use wgpu::wgt::{CommandEncoderDescriptor, DeviceDescriptor};
-use wgpu::{Color, ExperimentalFeatures, Label, LoadOp, MemoryHints, Operations, RenderPassColorAttachment, RenderPassDescriptor, StoreOp, SurfaceTexture, TextureUsages, TextureView, Trace};
+use wgpu::wgt::{CommandEncoderDescriptor, DeviceDescriptor, TextureDescriptor};
+use wgpu::{Color, ExperimentalFeatures, Extent3d, Label, LoadOp, MemoryHints, Operations, Origin3d, RenderPassColorAttachment, RenderPassDescriptor, StoreOp, SurfaceTexture, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect, TextureDimension, TextureFormat, TextureUsages, TextureView, Trace};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -72,6 +72,40 @@ impl State {
             surface,
             config,
             surface_configured: false
+        })
+    }
+
+    pub fn create_simple_2d_texture(&mut self, width: u32, height: u32, format: TextureFormat, usage: TextureUsages) -> Texture {
+        self.device.create_texture(&TextureDescriptor {
+            label: None,
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[]
+        })
+    }
+
+    pub fn queue_simple_2d_texture_write(&mut self, data: &[u8], stride: usize, texture: &Texture, width: u32, height: u32) {
+        self.queue.write_texture(TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        }, data, TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(stride as u32),
+            rows_per_image: Some(height),
+        }, Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
         })
     }
 

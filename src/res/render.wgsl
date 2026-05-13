@@ -24,6 +24,5 @@ var samp: sampler;
 
 @fragment
 fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let y = textureSample(tex, samp, in.uv).r;
-    return vec4<f32>(y, y, y, 1.0);
+    return textureSample(tex, samp, in.uv);
 }
