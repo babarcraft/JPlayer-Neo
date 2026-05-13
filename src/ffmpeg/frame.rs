@@ -146,14 +146,14 @@ impl Frame {
         }
     }
 
-    pub fn plane(&self, num: usize) -> &[u8] {
+    pub fn plane(&self, num: usize, chroma: usize) -> &[u8] {
         unsafe {
             let line_size = (*self.pointer).linesize[num] as usize;
             let data = (*self.pointer).data[num];
             if data.is_null() {
                 panic!("Invalid access of frame data! Plane {num} not found!")
             }
-            let height = (*self.pointer).height as usize;
+            let height = ((*self.pointer).height as usize) / (if num > 0 { chroma } else { 1 });
             std::slice::from_raw_parts(data, line_size * height)
         }
     }

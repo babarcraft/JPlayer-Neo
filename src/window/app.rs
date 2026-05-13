@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use egui_wgpu::RendererOptions;
 use ffmpeg_sys_next::AVPixelFormat::{AV_PIX_FMT_RGB24, AV_PIX_FMT_YUV420P};
 use wgpu::wgt::{CommandEncoderDescriptor, DeviceDescriptor, TextureDescriptor};
 use wgpu::{Color, ExperimentalFeatures, Extent3d, Label, LoadOp, MemoryHints, Operations, Origin3d, RenderPassColorAttachment, RenderPassDescriptor, StoreOp, SurfaceTexture, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect, TextureDimension, TextureFormat, TextureUsages, TextureView, Trace};
@@ -19,6 +20,9 @@ pub struct State {
     pub queue: wgpu::Queue,
     pub surface: wgpu::Surface<'static>,
     pub config: wgpu::SurfaceConfiguration,
+    pub egui_context: egui::Context,
+    pub egui_state: egui_winit::State,
+    pub egui_renderer: egui_wgpu::Renderer,
     surface_configured: bool
 }
 
@@ -64,6 +68,11 @@ impl State {
             desired_maximum_frame_latency: 2
         };
 
+        let egui_context = egui::Context::default();
+        let id = egui_context.viewport_id();
+        let egui_state = egui_winit::State::new(egui_context.clone(), id, &window, None, None, None);
+        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, RendererOptions::default());
+
         Ok(State {
             window: window.clone(),
             adapter,
@@ -71,7 +80,10 @@ impl State {
             queue,
             surface,
             config,
-            surface_configured: false
+            surface_configured: false,
+            egui_state,
+            egui_renderer,
+            egui_context,
         })
     }
 

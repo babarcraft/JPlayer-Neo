@@ -1,53 +1,266 @@
+use std::mem::{replace, take};
 use crate::ffmpeg::decode::{Decoder, DecoderResult};
 use crate::ffmpeg::frame::{ColorInfo, Frame};
 use crate::ffmpeg::input::{Input, Stream, StreamType};
 use crate::window::app::{AppContext, Scene, State};
 use std::ops::{Add, Index, Range};
+use std::sync::mpsc::Receiver;
 use std::time::Instant;
+use ffmpeg_sys_next::index;
 use wgpu::util::RenderEncoder;
 use wgpu::wgt::{BufferDescriptor, CommandEncoderDescriptor, SamplerDescriptor, TextureDescriptor, TextureViewDescriptor};
 use wgpu::LoadOp::Clear;
-use wgpu::{BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, BlendState, Buffer, BufferAddress, BufferBinding, BufferBindingType, BufferUsages, Color, ColorTargetState, ColorWrites, ComputePass, ComputePassDescriptor, ComputePipeline, ComputePipelineDescriptor, Extent3d, Face, FragmentState, FrontFace, IndexFormat, MultisampleState, Operations, Origin3d, PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology, RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor, Sampler, SamplerBindingType, ShaderModuleDescriptor, ShaderSource, ShaderStages, StorageTextureAccess, StoreOp, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect, TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDimension, VertexState};
+use wgpu::{BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, BlendState, Buffer, BufferAddress, BufferAsyncError, BufferBinding, BufferBindingType, BufferSlice, BufferUsages, BufferView, BufferViewMut, Color, ColorTargetState, ColorWrites, CommandEncoder, ComputePass, ComputePassDescriptor, ComputePipeline, ComputePipelineDescriptor, Extent3d, Face, FragmentState, FrontFace, IndexFormat, MapMode, MultisampleState, Operations, Origin3d, PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology, RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor, Sampler, SamplerBindingType, ShaderModuleDescriptor, ShaderSource, ShaderStages, StorageTextureAccess, StoreOp, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect, TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDimension, VertexState};
+use crate::RingBufferState::{Awaiting, Unmapped};
 
 pub mod window;
 pub mod ffmpeg;
 
+enum RingBufferState {
+    None,
+    Unmapped(Vec<Buffer>),
+    MappedNotFinished(Vec<Buffer>),
+    MappedWriting,
+    MappedWriteDone(Vec<Buffer>),
+    MappedReading,
+    MappedReadDone(Vec<Buffer>),
+    Awaiting(Vec<Buffer>, Receiver<Result<(), BufferAsyncError>>, usize),
+}
+
+struct RingBuffer {
+    buffers: Vec<RingBufferState>,
+    plane_sizes: Vec<usize>,
+    size: usize,
+    read: usize,
+    write: usize,
+}
+
+impl RingBuffer {
+
+    fn create_bind_group_layout(state: &mut State, plane_sizes: &[usize]) -> BindGroupLayout {
+        let mut entry_layouts = Vec::new();
+
+        for (i, _) in plane_sizes.iter().enumerate() {
+            entry_layouts.push(BindGroupLayoutEntry {
+                binding: i as u32,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None
+                },
+                count: None
+            });
+        }
+
+        state.device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: None,
+            entries: &entry_layouts,
+        })
+    }
+
+    fn create_bind_group(state: &mut State, buffers: &[Buffer], layout: &BindGroupLayout, plane_sizes: &[usize]) -> BindGroup {
+        let mut entries = Vec::new();
+
+        for (i, _) in plane_sizes.iter().enumerate() {
+            entries.push(BindGroupEntry {
+                binding: i as u32,
+                resource: buffers[i as usize].as_entire_binding()
+            });
+        }
+
+        state.device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &entries,
+        })
+    }
+
+    fn allocate_buffers(state: &mut State, plane_sizes: &[usize]) -> Vec<Buffer> {
+        let mut buffers = Vec::new();
+        for size in plane_sizes {
+            buffers.push(state.device.create_buffer(&BufferDescriptor {
+                label: None,
+                size: *size as BufferAddress,
+                usage: BufferUsages::MAP_WRITE | BufferUsages::COPY_SRC,
+                mapped_at_creation: false
+            }));
+        }
+        buffers
+    }
+
+    fn new(state: &mut State, capacity: usize, plane_sizes: &[usize]) -> RingBuffer {
+        let mut buffers = Vec::new();
+        for _ in 0..capacity {
+            let current_buffers = Self::allocate_buffers(state, plane_sizes);
+            buffers.push(RingBufferState::Unmapped(current_buffers));
+        }
+
+        RingBuffer {
+            buffers,
+            plane_sizes: plane_sizes.to_vec(),
+            size: 0,
+            read: 0,
+            write: 0,
+        }
+    }
+
+    fn reallocate(&mut self, state: &mut State, plane_sizes: &[usize]) {
+        let mut buffers = Vec::new();
+        for _ in 0..self.buffers.len() {
+            let current_buffers = Self::allocate_buffers(state, plane_sizes);
+            buffers.push(RingBufferState::Unmapped(current_buffers));
+        }
+        self.buffers = buffers;
+        self.plane_sizes = plane_sizes.to_vec();
+        self.size = 0;
+        self.read = 0;
+        self.write = 0;
+    }
+
+    fn check_allocate(&mut self, state: &mut State, plane_sizes: &[usize]) {
+        let mut realloc = false;
+        for (target, src) in self.plane_sizes.iter().zip(plane_sizes) {
+            if target != src {
+                realloc = true;
+                break
+            }
+        }
+        if realloc {
+            self.reallocate(state, plane_sizes);
+        }
+    }
+
+    fn update(&mut self) {
+        for i in 0..self.buffers.len() {
+            self.buffers[i] = match replace(&mut self.buffers[i], RingBufferState::None) {
+                Unmapped(buffers) => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    for buffer in &buffers {
+                        let sender = tx.clone();
+                        let slice = buffer.slice(..);
+                        slice.map_async(MapMode::Write, move |res| sender.send(res).unwrap());
+                    }
+                    let len = buffers.len();
+                    Awaiting(buffers, rx, len)
+                }
+                RingBufferState::MappedNotFinished(buffer) => {
+                    RingBufferState::MappedNotFinished(buffer)
+                },
+                RingBufferState::MappedReadDone(buffers) => {
+                    for buffer in &buffers {
+                        buffer.unmap();
+                    }
+                    Unmapped(buffers)
+                },
+                RingBufferState::Awaiting(buffer, rx, left) => {
+                    if let Some(Ok(_)) = rx.try_recv().ok() {
+                        if left == 1 {
+                            RingBufferState::MappedNotFinished(buffer)
+                        } else {
+                            RingBufferState::Awaiting(buffer, rx, left-1)
+                        }
+                    } else {
+                        RingBufferState::Awaiting(buffer, rx, left)
+                    }
+                },
+                RingBufferState::MappedWriteDone(buffer) => RingBufferState::MappedWriteDone(buffer),
+                RingBufferState::MappedWriting => RingBufferState::MappedWriting,
+                RingBufferState::MappedReading => RingBufferState::MappedReading,
+                RingBufferState::None => RingBufferState::None
+            };
+        }
+    }
+
+    fn get_write(&mut self) -> Option<Vec<Buffer>> {
+        if self.size >= self.buffers.len() {
+            return None;
+        }
+
+        let current = replace(&mut self.buffers[self.write], RingBufferState::None);
+        if let RingBufferState::MappedNotFinished(buffer) = current {
+            self.buffers[self.write] = RingBufferState::MappedWriting;
+            return Some(buffer);
+        }
+        self.buffers[self.write] = current;
+        None
+    }
+
+    fn commit_write(&mut self, buffer: Vec<Buffer>) {
+        self.buffers[self.write] = RingBufferState::MappedWriteDone(buffer);
+        self.write = (self.write + 1) % self.buffers.len();
+        self.size = self.size + 1;
+    }
+
+    fn get_read(&mut self) -> Option<Vec<Buffer>> {
+        if self.size <= 0 {
+            return None;
+        }
+
+        let current = replace(&mut self.buffers[self.read], RingBufferState::None);
+        if let RingBufferState::MappedWriteDone(buffers) = current {
+            for buffer in &buffers {
+                buffer.unmap()
+            }
+            self.buffers[self.read] = RingBufferState::MappedReading;
+            return Some(buffers);
+        }
+        self.buffers[self.read] = current;
+        None
+    }
+
+    fn commit_read(&mut self, buffer: Vec<Buffer>) {
+        self.buffers[self.read] = RingBufferState::Unmapped(buffer);
+        self.read = (self.read + 1) % self.buffers.len();
+        self.size = self.size - 1;
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ConverterParams {
+    stride_y: u32,
+    stride_uv: u32,
+    width: u32,
+    height: u32,
+}
 
 struct NV12Converter {
     pipeline: ComputePipeline,
     bind_group: BindGroup,
-    sampler: Sampler,
     output_texture: Texture,
-    y_texture: Texture,
-    uv_texture: Texture,
+    buffer: RingBuffer,
+    y_buffer: Buffer,
+    uv_buffer: Buffer,
     color_space_buffer: Buffer,
     color_offset_buffer: Buffer,
+    params_buffer: Buffer,
     width: u32,
     height: u32,
 }
 
 impl NV12Converter {
-    fn new(state: &mut State, width: u32, height: u32) -> Self {
+    fn new(state: &mut State, width: u32, height: u32, strides: &[usize]) -> Self {
         let bindgroup_layout = state.device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("NV12 to RGBA bind group layout"),
             entries: &[
                 BindGroupLayoutEntry {
                     binding: 0,
                     visibility: ShaderStages::COMPUTE,
-                    ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2,
-                        multisampled: false
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
                     count: None,
                 },
                 BindGroupLayoutEntry {
                     binding: 1,
                     visibility: ShaderStages::COMPUTE,
-                    ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2,
-                        multisampled: false
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
                     count: None,
                 },
@@ -64,7 +277,11 @@ impl NV12Converter {
                 BindGroupLayoutEntry {
                     binding: 3,
                     visibility: ShaderStages::COMPUTE,
-                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None
+                    },
                     count: None,
                 },
                 BindGroupLayoutEntry {
@@ -86,9 +303,14 @@ impl NV12Converter {
                         min_binding_size: None
                     },
                     count: None,
-                }
+                },
             ]
         });
+
+        let buffer = RingBuffer::new(state, 3, &[
+            height as usize * strides[0],
+            (height / 2) as usize * strides[1]
+        ]);
 
         let color_space_buffer = state.device.create_buffer(&BufferDescriptor {
             label: Some("NV12 to RGBA color info buffer"),
@@ -102,16 +324,23 @@ impl NV12Converter {
             usage: BufferUsages::COPY_DST | BufferUsages::UNIFORM,
             mapped_at_creation: false,
         });
-
-        let sampler = state.device.create_sampler(&SamplerDescriptor {
-            label: Some("NV12 to RGBA sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            ..Default::default()
+        let params_buffer = state.device.create_buffer(&BufferDescriptor {
+            label: Some("NV12 to RGBA color info buffer"),
+            size: size_of::<ConverterParams>() as BufferAddress,
+            usage: BufferUsages::COPY_DST | BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        });
+        let y_buffer = state.device.create_buffer(&BufferDescriptor {
+            label: Some("NV12 to RGBA color info buffer"),
+            size: strides[0] as BufferAddress * height as BufferAddress,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uv_buffer = state.device.create_buffer(&BufferDescriptor {
+            label: Some("NV12 to RGBA color info buffer"),
+            size: strides[0] as BufferAddress * (height / 2) as BufferAddress,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let output_texture = state.create_simple_2d_texture(
@@ -120,19 +349,6 @@ impl NV12Converter {
             TextureFormat::Rgba8Unorm,
             TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT
         );
-        let y_texture = state.create_simple_2d_texture(
-            width,
-            height,
-            TextureFormat::R8Unorm,
-            TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING
-        );
-        let uv_texture = state.create_simple_2d_texture(
-            width / 2,
-            height / 2,
-            TextureFormat::Rg8Unorm,
-            TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING
-        );
-
         let layout = state.device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("NV12 to RGBA layout"),
             bind_group_layouts: &[
@@ -147,11 +363,11 @@ impl NV12Converter {
             entries: &[
                 BindGroupEntry {
                     binding: 0,
-                    resource: BindingResource::TextureView(&y_texture.create_view(&TextureViewDescriptor::default()))
+                    resource: y_buffer.as_entire_binding(),
                 },
                 BindGroupEntry {
                     binding: 1,
-                    resource: BindingResource::TextureView(&uv_texture.create_view(&TextureViewDescriptor::default()))
+                    resource: uv_buffer.as_entire_binding(),
                 },
                 BindGroupEntry {
                     binding: 2,
@@ -159,15 +375,15 @@ impl NV12Converter {
                 },
                 BindGroupEntry {
                     binding: 3,
-                    resource: BindingResource::Sampler(&sampler)
-                },
-                BindGroupEntry {
-                    binding: 4,
                     resource: color_space_buffer.as_entire_binding(),
                 },
                 BindGroupEntry {
-                    binding: 5,
+                    binding: 4,
                     resource: color_offset_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 5,
+                    resource: params_buffer.as_entire_binding(),
                 }
             ]
         });
@@ -190,41 +406,55 @@ impl NV12Converter {
             pipeline,
             bind_group,
             output_texture,
-            y_texture,
-            uv_texture,
+            buffer,
+            y_buffer,
+            uv_buffer,
             width,
             height,
-            sampler,
             color_offset_buffer,
-            color_space_buffer
+            color_space_buffer,
+            params_buffer
         }
     }
 
-    pub fn convert(&mut self, pass: &mut ComputePass, state: &mut State, frame: &Frame) {
+    pub fn convert(&mut self, encoder: &mut CommandEncoder, state: &mut State, frame: &Frame) {
         state.queue.write_buffer(&self.color_space_buffer, 0, bytemuck::cast_slice(&[frame.color_space_matrix()]));
         state.queue.write_buffer(&self.color_offset_buffer, 0, bytemuck::cast_slice(&[frame.color_range_vec()]));
-        state.queue_simple_2d_texture_write(
-            frame.plane(0),
-            frame.plane_stride(0),
-            &self.y_texture,
-            self.width,
-            self.height
-        );
-        state.queue_simple_2d_texture_write(
-            frame.plane(1),
-            frame.plane_stride(1),
-            &self.uv_texture,
-            self.width / 2,
-            self.height / 2
-        );
+        state.queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[ConverterParams {
+            stride_y: frame.plane_stride(0) as u32,
+            stride_uv: frame.plane_stride(1) as u32,
+            width: frame.width() as u32,
+            height: frame.height() as u32,
+        }]));
 
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.dispatch_workgroups(
-            (self.width + 7) / 8,
-            (self.height + 7) / 8,
-            1
-        )
+        self.buffer.check_allocate(state, &[
+            frame.height() * frame.plane_stride(0),
+            (frame.height() / 2) * frame.plane_stride(1),
+        ]);
+        self.buffer.update();
+        if let Some(buffers) = self.buffer.get_write() {
+            for (index, buffer) in buffers.iter().enumerate() {
+                buffer.slice(..).get_mapped_range_mut().copy_from_slice(frame.plane(index, 2));
+            }
+            self.buffer.commit_write(buffers);
+        }
+
+        if let Some(buffers) = self.buffer.get_read() {
+            encoder.copy_buffer_to_buffer(&buffers[0], 0, &self.y_buffer, 0, Some(frame.plane_stride(0) as BufferAddress * self.height as BufferAddress));
+            encoder.copy_buffer_to_buffer(&buffers[1], 0, &self.uv_buffer, 0, Some(frame.plane_stride(1) as BufferAddress * (self.height / 2) as BufferAddress));
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(
+                (self.width + 7) / 8,
+                (self.height + 7) / 8,
+                1
+            );
+            self.buffer.commit_read(buffers);
+        }
     }
 }
 
@@ -326,11 +556,11 @@ impl PlayerScene {
 }
 
 impl PlayerScene {
-    fn upload_frame(&mut self, state: &mut State, pass: &mut ComputePass, frame: &Frame) -> Option<(u32, u32)> {
+    fn upload_frame(&mut self, state: &mut State, encoder: &mut CommandEncoder, frame: &Frame) -> Option<(u32, u32)> {
         let mut new_dims = None;
         if self.video_surface.is_none() {
             let (width, height) = frame.dimensions();
-            let converter = NV12Converter::new(state, frame.width() as u32, frame.height() as u32);
+            let converter = NV12Converter::new(state, frame.width() as u32, frame.height() as u32, &[frame.plane_stride(0), frame.plane_stride(1)]);
             let view = converter.output_texture.create_view(&wgpu::TextureViewDescriptor::default());
             let sampler = state.device.create_sampler(&SamplerDescriptor {
                 address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -370,7 +600,7 @@ impl PlayerScene {
         let surface = self.video_surface.as_mut().unwrap();
         frame.transfer_hw_data_to(&mut surface.frame, self.video_stream.as_ref().unwrap()).unwrap();
         let frame = &surface.frame;
-        surface.converter.convert(pass, state, frame);
+        surface.converter.convert(encoder, state, frame);
 
         new_dims
     }
@@ -472,10 +702,6 @@ impl Scene for PlayerScene {
         });
 
         {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None
-            });
             if self.current_frame.is_none() {
                 if let Some((time_range, frame)) = self.frame_channel.try_recv().ok() {
                     self.current_frame = Some((time_range, frame));
@@ -487,7 +713,7 @@ impl Scene for PlayerScene {
                     self.current_frame = Some((time_range, frame));
                 } else if current > time_range.end {
                 } else {
-                    if let Some((width, height)) = self.upload_frame(state, &mut pass, &frame) {
+                    if let Some((width, height)) = self.upload_frame(state, &mut encoder, &frame) {
                         let window_aspect = state.config.width as f32 / state.config.height as f32;
                         let image_aspect = width as f32 / height as f32;
 
