@@ -8,7 +8,7 @@ pub struct PixelBuffer {
 }
 
 impl PixelBuffer {
-    pub fn allocatePersistent(size: usize, flags: Option<u32>) -> Result<PixelBuffer, String> {
+    pub fn allocate_persistent(size: usize, flags: Option<u32>) -> Result<PixelBuffer, String> {
         unsafe {
             let mut id = 0;
             gl::GenBuffers(1, &mut id);
@@ -27,17 +27,42 @@ impl PixelBuffer {
             })
         }
     }
+
+    pub fn bind(&self) {
+        unsafe {
+            gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, self.id);
+        }
+    }
+
+    pub fn unbind(&self) {
+        unsafe {
+            gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, 0);
+        }
+    }
+
+    pub fn mapped(&mut self) -> Option<&mut [u8]> {
+        unsafe {
+            self.mapped_ptr.clone().map(|ptr| std::slice::from_raw_parts_mut(ptr, self.size))
+        }
+    }
 }
 
 impl Drop for PixelBuffer {
     fn drop(&mut self) {
         unsafe {
             gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, self.id);
-            if let Some(ptr) = self.mapped_ptr {
+            if let Some(_) = self.mapped_ptr {
                 gl::UnmapBuffer(gl::PIXEL_UNPACK_BUFFER);
             }
             gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, 0);
             gl::DeleteBuffers(1, &self.id);
         }
     }
+}
+
+pub enum LayoutElement {
+    Float(usize),
+    FloatNormalized(usize),
+    Int(usize),
+    IntNormalized(usize),
 }
