@@ -1,1 +1,4 @@
 /target
+Cargo.lock
+nanovg-sys/Cargo.lock
+/nanovg-sys/target/

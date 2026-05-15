@@ -4,13 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-pollster = "0.4.0"
-anyhow = "1.0.102"
-log = "0.4.29"
 ffmpeg-sys-next = "8.1.0"
 bytemuck = "1.25.0"
-egui = "0.34.2"
-egui-wgpu = "0.34.2"
-egui-winit = "0.34.2"
 glfw = "0.55"
 gl = "0.14"
+nanovg-sys = {
+    path = "./nanovg-sys",
+    default-features = false,
+    features = ["gl3"]
+}
