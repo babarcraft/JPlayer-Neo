@@ -6,7 +6,7 @@ use crate::ffmpeg::utils::*;
 
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Copy, Clone, Debug)]
 pub struct ColorInfo {
     color_space: [[f32; 3]; 3],
     color_offset: [f32; 3],
