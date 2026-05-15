@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::null_mut;
 use ffmpeg_sys_next::{av_hwdevice_ctx_create, avcodec_alloc_context3, avcodec_find_decoder, avcodec_free_context, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_send_packet, AVBufferRef, AVCodec, AVCodecContext, AVCodecHWConfig, AVHWDeviceType, AVPixelFormat, AVERROR_DECODER_NOT_FOUND, AVERROR_EOF, AVERROR_UNKNOWN};
-use wgpu::hal::DynOpenDevice;
 use crate::ffmpeg::error::Error;
 use crate::ffmpeg::frame::Frame;
 use crate::ffmpeg::input::Stream;
