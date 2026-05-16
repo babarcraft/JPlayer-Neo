@@ -7,7 +7,6 @@ fn main() {
     let mut glfw = glfw::init(glfw::fail_on_errors)
         .expect("Failed to init GLFW");
 
-    // Request OpenGL 4.5 Core
     glfw.window_hint(WindowHint::ContextVersion(4, 5));
     glfw.window_hint(WindowHint::OpenGlProfile(
         glfw::OpenGlProfileHint::Core,
