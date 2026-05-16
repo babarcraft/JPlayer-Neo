@@ -1,5 +1,8 @@
-use std::ptr::null;
-use gl::types::{GLint, GLuint};
+use std::ffi::c_void;
+use std::fs::symlink_metadata;
+use std::mem;
+use std::ptr::{null, null_mut};
+use gl::types::{GLenum, GLint, GLsizei, GLsizeiptr, GLuint, GLvoid};
 use crate::gs::texture::{InternalFormat, Texture};
 
 pub struct PixelBuffer {
@@ -116,15 +119,187 @@ impl Drop for FrameBuffer {
     }
 }
 
-pub enum LayoutElement {
-    Float(usize),
-    FloatNormalized(usize),
-    Int(usize),
-    IntNormalized(usize),
+#[derive(Copy, Clone)]
+pub enum LayoutElementType {
+    Float, Integer
+}
+
+pub enum LayoutElementStep {
+    Vertex, Instance
+}
+
+impl LayoutElementType {
+    pub fn byte_count(&self) -> usize {
+        match self {
+            LayoutElementType::Float => size_of::<f32>(),
+            LayoutElementType::Integer => size_of::<i32>(),
+        }
+    }
+}
+
+impl Into<GLenum> for LayoutElementType {
+    fn into(self) -> GLenum {
+        match self {
+            LayoutElementType::Float => gl::FLOAT,
+            LayoutElementType::Integer => gl::INT,
+        }
+    }
+}
+
+pub struct LayoutElement {
+    layout_element: LayoutElementType,
+    count: usize,
+    step: LayoutElementStep,
+}
+
+pub struct VertexBuffer {
+    id: GLuint,
+    pub size: Option<usize>,
+}
+
+impl VertexBuffer {
+    pub fn new() -> VertexBuffer {
+        unsafe {
+            let mut id = 0;
+            gl::GenBuffers(1, &mut id);
+            VertexBuffer {
+                id,
+                size: None,
+            }
+        }
+    }
+
+    pub fn bind(&self) {
+        unsafe {
+            gl::BindBuffer(gl::ARRAY_BUFFER, self.id);
+        }
+    }
+
+    pub fn unbind(&self) {
+        unsafe {
+            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+        }
+    }
+
+    pub fn upload_f32(&mut self, data: &[f32]) {
+        unsafe {
+            self.bind();
+            let size = data.len() * mem::size_of::<f32>();
+            gl::BufferData(gl::ARRAY_BUFFER, size as GLsizeiptr, data.as_ptr() as *const c_void, gl::STATIC_DRAW);
+            self.size = Some(size);
+            self.unbind();
+        }
+    }
+}
+
+impl Drop for VertexBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            gl::DeleteBuffers(1, &self.id);
+        }
+    }
+}
+
+pub struct ElementBuffer {
+    id: GLuint,
+    pub size: Option<usize>,
+}
+
+impl ElementBuffer {
+    pub fn new() -> ElementBuffer {
+        unsafe {
+            let mut id = 0;
+            gl::GenBuffers(1, &mut id);
+            ElementBuffer {
+                id,
+                size: None,
+            }
+        }
+    }
+
+    pub fn bind(&self) {
+        unsafe {
+            gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, self.id);
+        }
+    }
+
+    pub fn unbind(&self) {
+        unsafe {
+            gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, 0);
+        }
+    }
+
+    pub fn upload_u16(&mut self, data: &mut [u16]) {
+        unsafe {
+            self.bind();
+            let size = data.len() * mem::size_of::<u16>();
+            gl::BufferData(gl::ELEMENT_ARRAY_BUFFER, size as GLsizeiptr, data.as_ptr() as *const c_void, gl::STATIC_DRAW);
+            self.size = Some(size);
+            self.unbind();
+        }
+    }
+}
+
+impl Drop for ElementBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            gl::DeleteBuffers(1, &self.id);
+        }
+    }
 }
 
 pub struct VertexArray {
     id: GLuint,
+    current_index: usize,
+}
+
+impl VertexArray {
+    pub fn new() -> VertexArray {
+        unsafe {
+            let mut id = 0;
+            gl::GenVertexArrays(1, &mut id);
+            VertexArray {
+                id,
+                current_index: 0,
+            }
+        }
+    }
+
+    pub fn attach_buffer(&mut self, buffer: &VertexBuffer, layout: &[LayoutElement]) {
+        unsafe {
+            gl::BindVertexArray(self.id);
+            buffer.bind();
+            let stride = layout.iter()
+                .map(|element| element.count * element.layout_element.byte_count())
+                .sum::<usize>();
+            let mut current_offset = 0;
+            for element in layout {
+                let size = element.count * element.layout_element.byte_count();
+                gl::VertexAttribPointer(
+                    self.current_index as GLuint,
+                    element.count as GLint,
+                    element.layout_element.clone().into(),
+                    gl::FALSE,
+                    stride as GLsizei,
+                    current_offset as *const GLvoid
+                );
+                gl::EnableVertexAttribArray(self.current_index as GLuint);
+                match element.step {
+                    LayoutElementStep::Vertex => {
+                        gl::VertexAttribDivisor(self.current_index as GLuint, 0);
+                    },
+                    LayoutElementStep::Instance => {
+                        gl::VertexAttribDivisor(self.current_index as GLuint, 1);
+                    }
+                }
+
+                current_offset += size;
+                self.current_index += 1;
+            }
+            buffer.unbind();
+            gl::BindVertexArray(0);
+        }
+    }
 }
 
 impl Drop for VertexArray {
