@@ -2,20 +2,27 @@ mod ffmpeg;
 pub mod gs;
 pub mod player;
 
+use std::time::{Instant, SystemTime};
 use glfw::{Action, Context, Key, WindowHint};
 use crate::gs::buffer::{ElementBuffer, LayoutElement, LayoutElementStep, LayoutElementType, VertexArray, VertexBuffer};
-use crate::gs::shader::Shader;
+use crate::gs::gl::check_errors;
+use crate::gs::shader::{Shader, UniformValue};
+use crate::gs::texture::{InternalFormat, Texture};
 
-#[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    position: [f32; 2],
-    colors: [f32; 3],
+struct App {
+    vbo: VertexBuffer,
+    ebo: ElementBuffer,
+    vao: VertexArray,
+    texture: Texture,
+    compute_shader: Shader,
+    shader: Shader,
 }
 
+
+
+
 fn main() {
-    let mut glfw = glfw::init(glfw::fail_on_errors)
-        .expect("Failed to init GLFW");
+    let mut glfw = glfw::init(glfw::fail_on_errors).expect("Failed to init GLFW");
 
     glfw.window_hint(WindowHint::ContextVersion(4, 5));
     glfw.window_hint(WindowHint::OpenGlProfile(
@@ -40,22 +47,36 @@ fn main() {
 
     let mut vbo = VertexBuffer::new();
     vbo.upload_f32(&[
-        -0.5, -0.5,    1.0, 1.0, 1.0,
-        -0.5, 0.5,    1.0, 1.0, 1.0,
-        0.5, 0.5,    1.0, 1.0, 1.0,
+        -0.5, -0.5,    0.0, 0.0,
+        0.5, -0.5,    0.0, 1.0,
+        0.5, 0.5,    1.0, 1.0,
+        -0.5, 0.5,    1.0, 0.0,
     ]);
     let mut ebo = ElementBuffer::new();
     ebo.upload_u16(&[
-        0, 1, 2
+        0, 1, 2,
+        0, 3, 2
     ]);
     let mut vao = VertexArray::new();
     vao.attach_vertex_buffer(&vbo, &[
         LayoutElement { layout_element: LayoutElementType::Float, count: 2, step: LayoutElementStep::Vertex },
-        LayoutElement { layout_element: LayoutElementType::Float, count: 3, step: LayoutElementStep::Vertex },
+        LayoutElement { layout_element: LayoutElementType::Float, count: 2, step: LayoutElementStep::Vertex },
     ]);
     vao.attach_element_buffer(&ebo);
 
+    let mut texture = Texture::new();
+    texture.upload(None, None, 1000, 1000, InternalFormat::Rgba(8));
+    texture.bind(None);
+    texture.set_parameters(gl::LINEAR, gl::LINEAR, gl::CLAMP_TO_EDGE, gl::CLAMP_TO_EDGE);
+    texture.unbind();
+
+    let comp_shader = Shader::compile_compute(include_str!("res/test_comp.glsl")).unwrap();
+    comp_shader.bind();
+    let coef_uniform = comp_shader.get_uniform_location("coef").unwrap();
+    comp_shader.unbind();
+
     let shader = Shader::compile(include_str!("res/test.vert"), include_str!("res/test.frag")).unwrap();
+    let begin = Instant::now();
 
     while !window.should_close() {
         glfw.poll_events();
@@ -76,9 +97,18 @@ fn main() {
             gl::Clear(gl::COLOR_BUFFER_BIT);
         }
 
+        comp_shader.bind();
+        comp_shader.set_uniform(coef_uniform, &UniformValue::Float(begin.elapsed().as_secs_f32().cos()));
+        texture.bind_image(0);
+        comp_shader.dispatch_compute((texture.width.unwrap() + 15) / 16, (texture.height.unwrap() + 15) / 16, 1);
+        comp_shader.image_access_barrier();
+        comp_shader.unbind();
+
         shader.bind();
-        vao.draw_indexed(gl::TRIANGLES, 3, gl::UNSIGNED_SHORT);
+        texture.bind(Some(0));
+        vao.draw_indexed(gl::TRIANGLES, 6, gl::UNSIGNED_SHORT);
         shader.unbind();
+        check_errors("Render", true);
 
         window.swap_buffers();
     }

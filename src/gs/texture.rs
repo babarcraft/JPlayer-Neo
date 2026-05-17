@@ -200,6 +200,12 @@ impl Texture {
         }
     }
 
+    pub fn bind_image(&self, slot: u32) {
+        unsafe {
+            gl::BindImageTexture(slot, self.id, 0, gl::FALSE, 0, gl::WRITE_ONLY, self.format.unwrap().get_internal_format() as GLenum);
+        }
+    }
+
     pub fn upload_partial(&mut self, data: Option<&[u8]>, stride: Option<usize>, ox: u32, oy: u32, width: u32, height: u32) {
         unsafe {
             self.bind(None);

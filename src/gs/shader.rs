@@ -3,6 +3,7 @@ use std::ffi::{c_char, CStr, CString};
 use std::ptr::{null, null_mut};
 use std::str::FromStr;
 use gl::types::{GLchar, GLenum, GLint, GLsizei, GLuint};
+use crate::gs::gl::check_errors;
 
 pub enum UniformValue {
     Vec2([f32; 2]),
@@ -57,6 +58,24 @@ impl Shader {
         }
     }
 
+    pub fn compile_compute(source: &str) -> Result<Shader, String> {
+        unsafe {
+            let shader = Self::compile_shader(source, gl::COMPUTE_SHADER)?;
+            let id = gl::CreateProgram();
+            gl::AttachShader(id, shader);
+            gl::LinkProgram(id);
+            let mut result = 0;
+            gl::GetProgramiv(id, gl::LINK_STATUS, &mut result);
+            if result != gl::TRUE as GLint {
+                let mut buffer: [c_char; 1024] = [0; 1024];
+                gl::GetProgramInfoLog(id, buffer.len() as GLsizei, null_mut(), buffer.as_mut_ptr());
+                return Err(CStr::from_ptr(buffer.as_ptr()).to_string_lossy().into_owned());
+            }
+            gl::DeleteShader(shader);
+            Ok(Shader { id })
+        }
+    }
+
     pub fn bind(&self) {
         unsafe {
             gl::UseProgram(self.id);
@@ -66,6 +85,19 @@ impl Shader {
     pub fn unbind(&self) {
         unsafe {
             gl::UseProgram(0);
+        }
+    }
+
+    pub fn dispatch_compute(&self, size_x: u32, size_y: u32, size_z: u32) {
+        unsafe {
+            gl::DispatchCompute(size_x, size_y, size_z);
+            check_errors("Compute dispatch", false);
+        }
+    }
+
+    pub fn image_access_barrier(&self) {
+        unsafe {
+            gl::MemoryBarrier(gl::SHADER_IMAGE_ACCESS_BARRIER_BIT)
         }
     }
 
