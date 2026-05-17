@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 ffmpeg-sys-next = "8.1.0"
-bytemuck = "1.25.0"
+bytemuck = { version = "1.25.0", features = ["derive"] }
 glfw = "0.55"
 gl = "0.14"
 nanovg-sys = {

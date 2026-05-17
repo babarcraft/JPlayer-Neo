@@ -85,7 +85,7 @@ impl FrameBuffer {
     pub fn draw<F>(&mut self, width: u32, height: u32, mut draw: F) where F: FnMut() {
         unsafe {
             gl::BindFramebuffer(gl::FRAMEBUFFER, self.id);
-            self.texture.bind();
+            self.texture.bind(None);
 
             if !self.texture.has_space(width, height, InternalFormat::Rgba(8)) {
                 self.texture.upload(None, None, width, height, InternalFormat::Rgba(8));
@@ -94,7 +94,13 @@ impl FrameBuffer {
                     gl::LINEAR,
                     gl::NEAREST,
                     gl::NEAREST,
-                )
+                );
+                gl::FramebufferTexture2D(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, self.texture.id, 0);
+                let result = gl::CheckFramebufferStatus(gl::FRAMEBUFFER);
+                if result != gl::FRAMEBUFFER_COMPLETE {
+                    println!("Failed to attach FrameBuffer to Texture!");
+                    return;
+                }
             }
 
             let mut viewport: [GLint; 4] = [0; 4];
@@ -147,9 +153,9 @@ impl Into<GLenum> for LayoutElementType {
 }
 
 pub struct LayoutElement {
-    layout_element: LayoutElementType,
-    count: usize,
-    step: LayoutElementStep,
+    pub(crate) layout_element: LayoutElementType,
+    pub(crate) count: usize,
+    pub(crate) step: LayoutElementStep,
 }
 
 pub struct VertexBuffer {
@@ -190,6 +196,7 @@ impl VertexBuffer {
             self.unbind();
         }
     }
+
 }
 
 impl Drop for VertexBuffer {
@@ -229,7 +236,7 @@ impl ElementBuffer {
         }
     }
 
-    pub fn upload_u16(&mut self, data: &mut [u16]) {
+    pub fn upload_u16(&mut self, data: &[u16]) {
         unsafe {
             self.bind();
             let size = data.len() * mem::size_of::<u16>();
@@ -265,7 +272,16 @@ impl VertexArray {
         }
     }
 
-    pub fn attach_buffer(&mut self, buffer: &VertexBuffer, layout: &[LayoutElement]) {
+    pub fn attach_element_buffer(&mut self, buffer: &ElementBuffer) {
+        unsafe {
+            gl::BindVertexArray(self.id);
+            buffer.bind();
+            gl::BindVertexArray(0);
+            buffer.unbind();
+        }
+    }
+
+    pub fn attach_vertex_buffer(&mut self, buffer: &VertexBuffer, layout: &[LayoutElement]) {
         unsafe {
             gl::BindVertexArray(self.id);
             buffer.bind();
@@ -296,7 +312,16 @@ impl VertexArray {
                 current_offset += size;
                 self.current_index += 1;
             }
+            gl::BindVertexArray(0);
+
             buffer.unbind();
+        }
+    }
+
+    pub fn draw_indexed(&self, mode: GLenum, count: usize, ty: GLenum) {
+        unsafe {
+            gl::BindVertexArray(self.id);
+            gl::DrawElements(mode, count as GLsizei, ty, std::ptr::null());
             gl::BindVertexArray(0);
         }
     }

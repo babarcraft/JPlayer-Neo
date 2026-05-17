@@ -129,8 +129,11 @@ impl Texture {
         }
     }
 
-    pub fn bind(&self) {
+    pub fn bind(&self, slot: Option<u8>) {
         unsafe {
+            if let Some(slot) = slot {
+                gl::ActiveTexture(gl::TEXTURE0 + slot as GLuint);
+            }
             gl::BindTexture(gl::TEXTURE_2D, self.id);
         }
     }
@@ -170,6 +173,7 @@ impl Texture {
 
     pub fn upload(&mut self, data: Option<&[u8]>, stride: Option<usize>, width: u32, height: u32, format: InternalFormat) {
         unsafe {
+            self.bind(None);
             if let Some(stride) = stride {
                 gl::PixelStorei(gl::UNPACK_ROW_LENGTH, (stride / format.get_texel_size_bytes()) as GLint)
             }
@@ -192,11 +196,13 @@ impl Texture {
             if let Some(_) = stride {
                 gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0)
             }
+            self.unbind();
         }
     }
 
     pub fn upload_partial(&mut self, data: Option<&[u8]>, stride: Option<usize>, ox: u32, oy: u32, width: u32, height: u32) {
         unsafe {
+            self.bind(None);
             let format = self.format.expect("Expected allocated texture");
             if let Some(stride) = stride {
                 gl::PixelStorei(gl::UNPACK_ROW_LENGTH, (stride / format.get_texel_size_bytes()) as GLint)
@@ -217,6 +223,7 @@ impl Texture {
             if let Some(_) = stride {
                 gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0)
             }
+            self.unbind();
         }
     }
 }
