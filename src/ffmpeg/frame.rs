@@ -14,7 +14,7 @@ pub struct ColorInfo {
 }
 
 pub struct Frame {
-    pointer: *mut AVFrame,
+    pub(crate) pointer: *mut AVFrame,
     pub serial: Option<u32>,
     pub pts: Option<f64>,
     pub duration: Option<f64>,

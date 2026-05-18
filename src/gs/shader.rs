@@ -24,7 +24,8 @@ impl Shader {
     fn compile_shader(source: &str, ty: GLenum) -> Result<GLuint, String> {
         unsafe {
             let shader = gl::CreateShader(ty);
-            gl::ShaderSource(shader, 1, &CString::from_str(source).unwrap().as_ptr(), null());
+            let string = CString::from_str(source).unwrap();
+            gl::ShaderSource(shader, 1, &string.as_ptr(), null());
             gl::CompileShader(shader);
             let mut result = 0;
             gl::GetShaderiv(shader, gl::COMPILE_STATUS, &mut result);

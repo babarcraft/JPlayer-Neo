@@ -24,6 +24,7 @@ impl PixelBuffer {
             if ptr.is_null() {
                 return Err("Unable to map!".into())
             }
+            gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, 0);
             Ok(PixelBuffer {
                 id,
                 immutable: true,

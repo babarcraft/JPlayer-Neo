@@ -167,13 +167,12 @@ impl Texture {
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, mag_filter as GLint);
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, wrap_s as GLint);
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, wrap_t as GLint);
-            check_errors("Set Texture Parameters", false)
+            check_errors("Set Texture Parameters", false);
         }
     }
 
     pub fn upload(&mut self, data: Option<&[u8]>, stride: Option<usize>, width: u32, height: u32, format: InternalFormat) {
         unsafe {
-            self.bind(None);
             if let Some(stride) = stride {
                 gl::PixelStorei(gl::UNPACK_ROW_LENGTH, (stride / format.get_texel_size_bytes()) as GLint)
             }
@@ -196,7 +195,6 @@ impl Texture {
             if let Some(_) = stride {
                 gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0)
             }
-            self.unbind();
         }
     }
 
@@ -208,10 +206,10 @@ impl Texture {
 
     pub fn upload_partial(&mut self, data: Option<&[u8]>, stride: Option<usize>, ox: u32, oy: u32, width: u32, height: u32) {
         unsafe {
-            self.bind(None);
             let format = self.format.expect("Expected allocated texture");
             if let Some(stride) = stride {
-                gl::PixelStorei(gl::UNPACK_ROW_LENGTH, (stride / format.get_texel_size_bytes()) as GLint)
+                gl::PixelStorei(gl::UNPACK_ROW_LENGTH, (stride / format.get_texel_size_bytes()) as GLint);
+                gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
             }
             gl::TexSubImage2D(
                 gl::TEXTURE_2D,
@@ -224,12 +222,12 @@ impl Texture {
                 format.get_type(),
                 data.map(|data| data.as_ptr() as *const std::ffi::c_void).unwrap_or(null())
             );
-            check_errors("Texture Partial Upload", false);
+            check_errors("Texture Partial Upload", true);
 
             if let Some(_) = stride {
-                gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0)
+                gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
+                gl::PixelStorei(gl::UNPACK_ALIGNMENT, 4);
             }
-            self.unbind();
         }
     }
 }
