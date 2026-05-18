@@ -13,6 +13,7 @@ pub struct ColorInfo {
     others: [f32; 4],
 }
 
+#[derive(Debug)]
 pub struct Frame {
     pub(crate) pointer: *mut AVFrame,
     pub serial: Option<u32>,

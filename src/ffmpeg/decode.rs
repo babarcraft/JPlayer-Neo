@@ -102,7 +102,7 @@ impl Decoder {
         frame.receive_frame_from_decoder(self.serial, &self.stream, self.context)
     }
 
-    pub fn send_packet(&mut self, packet: Packet) -> Result<(), Error> {
+    pub fn send_packet(&mut self, packet: &Packet) -> Result<(), Error> {
         unsafe {
             let result = avcodec_send_packet(self.context, packet.pointer);
             if result < 0 {
