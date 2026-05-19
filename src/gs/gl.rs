@@ -42,3 +42,9 @@ pub fn check_errors(action: &'static str, panic: bool) {
         }
     }
 }
+
+pub fn mapped_buffer_barrier() {
+    unsafe {
+        gl::MemoryBarrier(gl::CLIENT_MAPPED_BUFFER_BARRIER_BIT);
+    }
+}

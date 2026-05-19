@@ -29,6 +29,7 @@ impl Window {
         window.make_current();
         window.set_key_polling(true);
         window.set_framebuffer_size_polling(true);
+        window.set_size_polling(true);
 
         gl::load_with(|symbol| window.get_proc_address(symbol) as *const _);
         
@@ -39,10 +40,15 @@ impl Window {
         };
         Some(window)
     }
+
+    pub fn set_size(&mut self, width: u32, height: u32) {
+        self.window.set_size(width as i32, height as i32);
+    }
     
     pub fn run(&mut self, handler: &mut dyn WindowHandler) {
         handler.initialize(self);
 
+        let mut manual_change = false;
         let mut last = Some(Instant::now());
         while !self.window.should_close() {
             self.glfw.poll_events();
@@ -60,12 +66,21 @@ impl Window {
                             gl::Viewport(0, 0, width, height);
                         }
                     }
+                    glfw::WindowEvent::Size(w, h) => {
+                        if !manual_change {
+                            self.window.set_size(h / 4, h);
+                            manual_change = true;
+                        } else {
+                            manual_change = false;
+                        }
+                    }
                     _ => {}
                 }
             }
             
             if let Some(time) = last.take() {
-                handler.render(time.elapsed().as_secs_f32(), self)
+                handler.render(time.elapsed().as_secs_f32(), self);
+                last = Some(Instant::now());
             } else {
                 last = Some(Instant::now());
             }
@@ -74,5 +89,10 @@ impl Window {
 
             self.window.swap_buffers();
         }
+    }
+
+    pub fn get_size(&self) -> (f32, f32) {
+        let (w, h) = self.window.get_size();
+        (w as f32, h as f32)
     }
 }

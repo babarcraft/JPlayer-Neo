@@ -18,7 +18,7 @@ pub struct Decoder {
     context: *mut AVCodecContext,
     preferred_pix_format: Box<AVPixelFormat>,
     pub serial: Option<u32>,
-    pub stream: Stream,
+    pub timebase: f64,
 }
 
 unsafe extern "C" fn get_format_callback(context: *mut AVCodecContext, format: *const AVPixelFormat) -> AVPixelFormat {
@@ -52,7 +52,7 @@ fn get_hardware_pix_format(codec: *const AVCodec) -> Option<(AVHWDeviceType, AVP
 }
 
 impl Decoder {
-    pub fn new(stream: Stream, options: Vec<(&str, &str)>) -> Result<Decoder, Error> {
+    pub fn new(stream: &Stream, options: Vec<(&str, &str)>) -> Result<Decoder, Error> {
         unsafe {
             let parameters = stream.parameters;
             let codec = avcodec_find_decoder((*parameters).codec_id);
@@ -93,13 +93,13 @@ impl Decoder {
                 context,
                 serial: None,
                 preferred_pix_format,
-                stream,
+                timebase: stream.timebase,
             })
         }
     }
 
     pub fn receive_frame(&mut self, frame: &mut Frame) -> DecoderResult {
-        frame.receive_frame_from_decoder(self.serial, &self.stream, self.context)
+        frame.receive_frame_from_decoder(self.serial, self.timebase, self.context)
     }
 
     pub fn send_packet(&mut self, packet: &Packet) -> Result<(), Error> {

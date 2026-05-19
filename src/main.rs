@@ -2,7 +2,8 @@ mod ffmpeg;
 pub mod gs;
 pub mod player;
 
-use std::sync::mpsc::Receiver;
+use std::ops::Div;
+use std::sync::mpsc::{Receiver, Sender};
 use std::thread::{JoinHandle, Thread};
 use std::time::{Instant, SystemTime};
 use gl::types::{GLint, GLuint};
@@ -11,36 +12,32 @@ use crate::ffmpeg::decode::{Decoder, DecoderResult};
 use crate::ffmpeg::frame::Frame;
 use crate::ffmpeg::input::{Input, Stream, StreamType};
 use crate::gs::buffer::{ElementBuffer, LayoutElement, LayoutElementStep, LayoutElementType, PixelBuffer, VertexArray, VertexBuffer};
-use crate::gs::gl::check_errors;
+use crate::gs::gl::{check_errors, mapped_buffer_barrier};
 use crate::gs::shader::{Shader, UniformValue};
 use crate::gs::texture::{InternalFormat, Texture};
 use crate::gs::window::{Window, WindowHandler};
-use std::sync::{Arc, Mutex, MutexGuard, Condvar};
+use std::sync::{Arc, Mutex, MutexGuard, Condvar, RwLock};
+use ffmpeg_sys_next::av_opt_query_ranges;
+use nanovg_sys::NVGpaint;
+use crate::gs::nvg::NvgContext;
+use crate::player::surface::{FrameQueue, VideoSurface};
 
 struct App {
     vbo: VertexBuffer,
     ebo: ElementBuffer,
     vao: VertexArray,
     texture: Texture,
-
-    compute_shader: Shader,
-    comp_y: GLint,
-    comp_uv: GLint,
-
     shader: Shader,
-
     thread: JoinHandle<()>,
-    receiver: Receiver<Frame>,
-
+    sender: Sender<bool>,
+    frame_queue: Arc<RwLock<FrameQueue>>,
     stream: Stream,
-
     begin: Instant,
-
     frame_sw: Frame,
     last_frame: Option<Frame>,
-
-    y_plane: Option<(PixelBuffer, Texture)>,
-    uv_plane: Option<(PixelBuffer, Texture)>,
+    video_surface: VideoSurface,
+    nvg_context: NvgContext,
+    nvg_image: Option<i32>,
 }
 
 impl App {
@@ -93,8 +90,10 @@ impl App {
             .unwrap()
             .clone();
 
-        let (sender, receiver) = std::sync::mpsc::sync_channel(15);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let frame_queue = Arc::new(RwLock::new(FrameQueue::new(15)));
 
+        let frame_queue_clone = frame_queue.clone();
         let thread = std::thread::spawn(move || {
             let stream = input
                 .streams
@@ -104,7 +103,7 @@ impl App {
 
             let index = stream.index;
 
-            let mut decoder = Decoder::new(stream.clone(), vec![]).unwrap();
+            let mut decoder = Decoder::new(&stream, vec![]).unwrap();
             let mut frame = Frame::new();
 
             while let Some(packet) = input.read_packet().ok() {
@@ -115,8 +114,22 @@ impl App {
                 loop {
                     match decoder.receive_frame(&mut frame) {
                         DecoderResult::FrameReceived => {
-                            sender.send(frame.clone()).unwrap();
-                            frame.unref();
+                            let mut wait = false;
+                            loop {
+                                if wait {
+                                    receiver.recv().unwrap();
+                                }
+                                let mut lock = frame_queue_clone.write().unwrap();
+                                if let Some(copy_frame) = lock.peek_write() {
+                                    copy_frame.unref();
+                                    frame.transfer_hw_data_to(copy_frame).unwrap();
+                                    lock.push();
+                                    break;
+                                } else {
+                                    wait = true;
+                                    continue;
+                                }
+                            }
                         }
 
                         DecoderResult::Error(error) => {
@@ -132,46 +145,30 @@ impl App {
             }
         });
 
-        let comp_shader =
-            Shader::compile_compute(include_str!("res/test_comp.glsl")).unwrap();
-
-        comp_shader.bind();
-
-        let comp_y = comp_shader.get_uniform_location("texY").unwrap();
-        let comp_uv = comp_shader.get_uniform_location("texUV").unwrap();
-
-        comp_shader.unbind();
-
         let shader = Shader::compile(
             include_str!("res/test.vert"),
             include_str!("res/test.frag"),
-        )
-            .unwrap();
+        ).unwrap();
+
+        let surface = VideoSurface::new();
+        let nvg_context = NvgContext::new();
 
         Self {
             vbo,
             ebo,
             vao,
             texture,
-
-            compute_shader: comp_shader,
-            comp_y,
-            comp_uv,
-
             shader,
-
             thread,
-            receiver,
-
+            frame_queue,
+            sender,
             stream,
-
             begin: Instant::now(),
-
             frame_sw: Frame::new(),
+            video_surface: surface,
             last_frame: None,
-
-            y_plane: None,
-            uv_plane: None,
+            nvg_context,
+            nvg_image: None,
         }
     }
 }
@@ -180,197 +177,63 @@ impl WindowHandler for App {
     fn initialize(&mut self, window: &mut Window) {}
 
     fn render(&mut self, dt: f32, window: &mut Window) {
-        if self.last_frame.is_none() {
-            self.last_frame = self.receiver.try_recv().ok();
-        }
+        {
+            let queue = self.frame_queue.read().unwrap();
+            if let Some(frame) = queue.peek_read() {
+                let pts = frame.pts.unwrap();
+                let duration = frame.duration.unwrap();
 
-        let mut frame = None;
+                let range = pts..pts + duration;
 
-        if let Some(last_frame) = self.last_frame.take() {
-            let pts = last_frame.pts.unwrap();
-            let duration = last_frame.duration.unwrap();
+                let clock = self.begin.elapsed().as_secs_f64();
 
-            let range = pts..pts + duration;
+                if range.contains(&clock) {
+                    self.video_surface.upload(frame, &[
+                        InternalFormat::R(8),
+                        InternalFormat::Rg(8),
+                    ], Some(2));
+                    self.video_surface.convert_output();
 
-            let clock = self.begin.elapsed().as_secs_f64();
+                    self.nvg_image.get_or_insert_with(|| {
+                        self.nvg_context.create_texture_image(&self.video_surface.output_texture)
+                    });
 
-            if range.contains(&clock) {
-                self.frame_sw.unref();
-
-                last_frame
-                    .transfer_hw_data_to(&mut self.frame_sw, &self.stream)
-                    .unwrap();
-
-                frame = Some(&self.frame_sw);
-            } else if clock < pts {
-                self.last_frame = Some(last_frame);
-            }
-        }
-
-        if let Some(frame) = frame {
-            if !self.texture.has_space(
-                frame.width() as u32,
-                frame.height() as u32,
-                InternalFormat::Rgba(8),
-            ) {
-                self.texture.bind(Some(0));
-
-                self.texture.upload(
-                    None,
-                    None,
-                    frame.width() as u32,
-                    frame.height() as u32,
-                    InternalFormat::Rgba(8),
-                );
-
-                self.texture.set_parameters(
-                    gl::LINEAR,
-                    gl::LINEAR,
-                    gl::CLAMP_TO_EDGE,
-                    gl::CLAMP_TO_EDGE,
-                );
-
-                self.texture.unbind();
-            }
-
-            if let None = self.y_plane {
-                let y_buffer = PixelBuffer::allocate_persistent(
-                    frame.height() * frame.plane_stride(0),
-                    None,
-                )
-                    .unwrap();
-
-                let mut y_texture = Texture::new();
-
-                y_texture.bind(Some(0));
-
-                y_texture.upload(
-                    None,
-                    None,
-                    frame.width() as u32,
-                    frame.height() as u32,
-                    InternalFormat::R(8),
-                );
-
-                y_texture.set_parameters(
-                    gl::LINEAR,
-                    gl::LINEAR,
-                    gl::CLAMP_TO_EDGE,
-                    gl::CLAMP_TO_EDGE,
-                );
-
-                y_texture.unbind();
-
-                self.y_plane = Some((y_buffer, y_texture));
-            }
-
-            if let None = self.uv_plane {
-                let uv_buffer = PixelBuffer::allocate_persistent(
-                    (frame.height() / 2) * frame.plane_stride(1),
-                    None,
-                )
-                    .unwrap();
-
-                let mut uv_texture = Texture::new();
-
-                uv_texture.bind(Some(1));
-
-                uv_texture.upload(
-                    None,
-                    None,
-                    (frame.width() / 2) as u32,
-                    (frame.height() / 2) as u32,
-                    InternalFormat::Rg(8),
-                );
-
-                uv_texture.set_parameters(
-                    gl::LINEAR,
-                    gl::LINEAR,
-                    gl::CLAMP_TO_EDGE,
-                    gl::CLAMP_TO_EDGE,
-                );
-
-                uv_texture.unbind();
-
-                self.uv_plane = Some((uv_buffer, uv_texture));
-            }
-
-            self.compute_shader.bind();
-
-            if let Some((pbo, texture)) = &mut self.y_plane {
-                pbo.mapped()
-                    .unwrap()
-                    .copy_from_slice(frame.plane(0, 2));
-
-                unsafe {
-                    gl::MemoryBarrier(gl::CLIENT_MAPPED_BUFFER_BARRIER_BIT);
+                    let should_notify = !queue.has_space();
+                    drop(queue);
+                    let mut queue = self.frame_queue.write().unwrap();
+                    queue.pop();
+                    if should_notify {
+                        self.sender.send(false).unwrap();
+                    }
+                } else if clock < pts {
+                } else {
+                    drop(queue);
+                    let mut queue = self.frame_queue.write().unwrap();
+                    queue.pop();
+                    self.sender.send(false).unwrap();
                 }
-
-                pbo.bind();
-
-                texture.bind(Some(0));
-
-                texture.upload_partial(
-                    None,
-                    Some(frame.plane_stride(0)),
-                    0,
-                    0,
-                    frame.width() as u32,
-                    frame.height() as u32,
-                );
-
-                pbo.unbind();
             }
-
-            if let Some((pbo, texture)) = &mut self.uv_plane {
-                pbo.mapped()
-                    .unwrap()
-                    .copy_from_slice(frame.plane(1, 2));
-
-                unsafe {
-                    gl::MemoryBarrier(gl::CLIENT_MAPPED_BUFFER_BARRIER_BIT);
-                }
-
-                check_errors("Upload uv", true);
-
-                pbo.bind();
-
-                texture.bind(Some(1));
-
-                texture.upload_partial(
-                    None,
-                    Some(frame.plane_stride(1)),
-                    0,
-                    0,
-                    (frame.width() / 2) as u32,
-                    (frame.height() / 2) as u32,
-                );
-
-                pbo.unbind();
-            }
-
-            self.texture.bind_image(2);
-
-            self.compute_shader.dispatch_compute(
-                (frame.width() + 15) as u32 / 16,
-                (frame.height() + 15) as u32 / 16,
-                1,
-            );
-
-            self.compute_shader.image_access_barrier();
-            self.compute_shader.unbind();
         }
 
-        self.shader.bind();
+        let (w, h) = window.get_size();
+        self.nvg_context.frame((w, h), |context| {
+            if let Some(image) = self.nvg_image {
+                let vw = self.video_surface.output_texture.width.unwrap() as f32;
+                let vh = self.video_surface.output_texture.height.unwrap() as f32;
+                let s = (w / vw).min(h / vh);
 
-        self.texture.bind(Some(0));
+                let pw = s * vw;
+                let ph = s * vh;
+                let ox = (w - pw).div(2.0).max(0.0);
+                let oy = (h - ph).div(2.0).max(0.0);
 
-        self.vao
-            .draw_indexed(gl::TRIANGLES, 6, gl::UNSIGNED_SHORT);
-
-        self.texture.unbind();
-
-        self.shader.unbind();
+                let paint = context.image_paint(image, (ox, oy), (pw, ph));
+                context.set_fill_paint(paint);
+                context.begin_path();
+                context.rect((ox, oy), (pw, ph));
+                context.fill();
+            }
+        });
     }
 }
 

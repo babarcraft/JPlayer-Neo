@@ -204,7 +204,7 @@ impl Texture {
         }
     }
 
-    pub fn upload_partial(&mut self, data: Option<&[u8]>, stride: Option<usize>, ox: u32, oy: u32, width: u32, height: u32) {
+    pub fn upload_partial(&self, data: Option<&[u8]>, stride: Option<usize>, ox: u32, oy: u32, width: u32, height: u32) {
         unsafe {
             let format = self.format.expect("Expected allocated texture");
             if let Some(stride) = stride {

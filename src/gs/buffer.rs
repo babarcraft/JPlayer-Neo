@@ -46,7 +46,7 @@ impl PixelBuffer {
         }
     }
 
-    pub fn mapped(&mut self) -> Option<&mut [u8]> {
+    pub fn mapped(&self) -> Option<&mut [u8]> {
         unsafe {
             self.mapped_ptr.clone().map(|ptr| std::slice::from_raw_parts_mut(ptr, self.size))
         }
