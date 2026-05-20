@@ -7,6 +7,9 @@ pub struct Packet {
     pub id: usize
 }
 
+unsafe impl Send for Packet {}
+unsafe impl Sync for Packet {}
+
 impl Packet {
     pub fn new(serial: u32, id: usize) -> Self {
         unsafe {

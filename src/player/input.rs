@@ -1,10 +1,15 @@
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ops::Deref;
-use std::sync::{Arc, RwLock};
+use std::rc::Rc;
+use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread::JoinHandle;
 use ffmpeg_sys_next::AV_NOPTS_VALUE;
-use crate::ffmpeg::input::Stream;
+use crate::ffmpeg::input::{Input, Stream};
 use crate::ffmpeg::packet::Packet;
 use crate::gs::texture::Texture;
+use crate::player::decoder::DecodeWorkerMessage;
 
 /// Serves as a normal queue, with the only difference being that it counts the duration of packets from the lowest to the highest instead of just a number.
 #[derive(Clone)]
@@ -50,5 +55,44 @@ impl PacketQueue {
     
     pub fn queued(&self) -> Option<f64> {
         Some(self.end_pts? - self.begin_pts?)
+    }
+}
+
+pub enum InputWorkerMessage {
+    End,
+    Update
+}
+
+pub struct InputPair {
+    sender: Sender<DecodeWorkerMessage>,
+    input: Arc<Mutex<Input>>,
+    queue: Arc<RwLock<PacketQueue>>,
+}
+
+pub struct InputWorker {
+    sender: Sender<InputWorkerMessage>,
+    inputs: Arc<Mutex<Vec<InputPair>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl InputWorker {
+    pub fn new() -> InputWorker {
+        let (sender, receiver) = mpsc::channel();
+        let inputs: Arc<Mutex<Vec<InputPair>>> = Arc::new(Mutex::new(Vec::new()));
+        let thread = {
+            let inputs = inputs.clone();
+            Some(std::thread::spawn(move || {
+                loop {
+                    let mut inputs = inputs.lock().unwrap();
+                    todo!()
+                }
+            }))
+        };
+
+        InputWorker {
+            thread,
+            inputs,
+            sender,
+        }
     }
 }

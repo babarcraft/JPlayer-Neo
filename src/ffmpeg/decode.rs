@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::null_mut;
-use ffmpeg_sys_next::{av_hwdevice_ctx_create, avcodec_alloc_context3, avcodec_find_decoder, avcodec_free_context, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_send_packet, AVBufferRef, AVCodec, AVCodecContext, AVCodecHWConfig, AVHWDeviceType, AVPixelFormat, AVERROR_DECODER_NOT_FOUND, AVERROR_EOF, AVERROR_UNKNOWN};
+use ffmpeg_sys_next::{av_hwdevice_ctx_create, avcodec_alloc_context3, avcodec_find_decoder, avcodec_flush_buffers, avcodec_free_context, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_send_packet, AVBufferRef, AVCodec, AVCodecContext, AVCodecHWConfig, AVHWDeviceType, AVPixelFormat, AVERROR_DECODER_NOT_FOUND, AVERROR_EOF, AVERROR_UNKNOWN};
 use crate::ffmpeg::error::Error;
 use crate::ffmpeg::frame::Frame;
 use crate::ffmpeg::input::Stream;
@@ -20,6 +20,8 @@ pub struct Decoder {
     pub serial: Option<u32>,
     pub timebase: f64,
 }
+
+unsafe impl Send for Decoder {}
 
 unsafe extern "C" fn get_format_callback(context: *mut AVCodecContext, format: *const AVPixelFormat) -> AVPixelFormat {
     unsafe {
@@ -104,6 +106,15 @@ impl Decoder {
 
     pub fn send_packet(&mut self, packet: &Packet) -> Result<(), Error> {
         unsafe {
+            if let Some(serial) = self.serial {
+                if serial != packet.serial {
+                    avcodec_flush_buffers(self.context);
+                    self.serial = Some(serial);
+                }
+            } else {
+                avcodec_flush_buffers(self.context);
+                self.serial = Some(packet.serial);
+            }
             let result = avcodec_send_packet(self.context, packet.pointer);
             if result < 0 {
                 Err(Error::from_code(result))
