@@ -1,7 +1,10 @@
+use std::ffi::c_void;
 use std::io::Chain;
-use ffmpeg_sys_next::{av_frame_alloc, av_frame_clone, av_frame_copy_props, av_frame_free, av_frame_move_ref, av_frame_unref, av_hwframe_transfer_data, avcodec_receive_frame, AVCodecContext, AVColorRange, AVColorSpace, AVFrame, AVPixelFormat, AVERROR, EAGAIN, EOF};
+use std::ptr::null_mut;
+use ffmpeg_sys_next::{av_frame_alloc, av_frame_clone, av_frame_copy_props, av_frame_free, av_frame_move_ref, av_frame_unref, av_free, av_hwframe_transfer_data, av_malloc, avcodec_receive_frame, AVChannelLayout, AVCodecContext, AVColorRange, AVColorSpace, AVFrame, AVPixelFormat, AVSampleFormat, AVERROR, EAGAIN, EOF};
 use crate::ffmpeg::decode::DecoderResult;
 use crate::ffmpeg::error::Error;
+use crate::ffmpeg::frame::SampleType::Float;
 use crate::ffmpeg::input::Stream;
 use crate::ffmpeg::utils::*;
 
@@ -84,6 +87,24 @@ impl Frame {
             other.timebase = self.timebase;
             other.update_data(other.serial);
             Ok(())
+        }
+    }
+
+    pub fn sample_format(&self) -> Option<AVSampleFormat> {
+        unsafe {
+            std::mem::transmute((*self.pointer).format)
+        }
+    }
+
+    pub fn channel_layout(&self) -> AVChannelLayout {
+        unsafe {
+            (*self.pointer).ch_layout
+        }
+    }
+
+    pub fn num_samples(&self) -> usize {
+        unsafe {
+            (*self.pointer).nb_samples as usize
         }
     }
 
@@ -205,6 +226,84 @@ impl Drop for Frame {
     fn drop(&mut self) {
         unsafe {
             av_frame_free(&mut self.pointer);
+        }
+    }
+}
+
+pub enum SampleType {
+    Float
+}
+
+pub struct AudioFrame {
+    pub planes: [*mut u8; 8],
+    pub plane_sizes: [Option<usize>; 8],
+    pub num_planes: usize,
+    pub channels: usize,
+    pub sample_rate: u32,
+    pub sample_type: SampleType,
+    pub num_samples: usize,
+    pub pts: Option<f64>,
+    pub duration: Option<f64>,
+    pub serial: Option<u32>
+}
+
+unsafe impl Send for AudioFrame {}
+unsafe impl Sync for AudioFrame {}
+
+impl AudioFrame {
+    pub fn new() -> Self {
+        Self {
+            planes: [const { null_mut() }; 8],
+            plane_sizes: [const { None }; 8],
+            num_planes: 0,
+            sample_type: Float,
+            channels: 0,
+            sample_rate: 0,
+            num_samples: 0,
+            pts: None,
+            duration: None,
+            serial: None
+        }
+    }
+
+    pub fn ensure_allocated(&mut self, plane_size: usize, planes: usize) {
+        for index in 0..planes {
+            let plane_ptr = &mut self.planes[index];
+            if plane_ptr.is_null() {
+                continue;
+            }
+            if let Some(size) = &mut self.plane_sizes[index] {
+                if *size != plane_size {
+                    self.planes[index] = unsafe {
+                        av_malloc(plane_size) as *mut u8
+                    };
+                    *size = plane_size;
+                }
+            } else {
+                self.planes[index] = unsafe {
+                    av_malloc(plane_size) as *mut u8
+                };
+                self.plane_sizes[index] = Some(plane_size);
+            }
+        }
+        for i in self.num_planes..planes.max(self.num_planes) {
+            let plane_ptr = &mut self.planes[i];
+            if !plane_ptr.is_null() {
+                unsafe {
+                    av_free(*plane_ptr as *mut c_void);
+                }
+                *plane_ptr = null_mut();
+            }
+        }
+    }
+}
+
+impl Drop for AudioFrame {
+    fn drop(&mut self) {
+        for plane in &self.planes[0..self.num_planes] {
+            unsafe {
+                av_free(*plane as *mut c_void);
+            }
         }
     }
 }
