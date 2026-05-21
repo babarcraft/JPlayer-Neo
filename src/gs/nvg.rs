@@ -1,4 +1,7 @@
-use nanovg_sys::{nvgBeginFrame, nvgBeginPath, nvgCreateGL3, nvgEndFrame, nvgFill, nvgFillPaint, nvgImagePattern, nvgRect, nvglCreateImageFromHandleGL3, NVGpaint};
+use std::ffi::{CStr, CString};
+use std::ptr::{null, null_mut};
+use std::str::FromStr;
+use nanovg_sys::{nvgBeginFrame, nvgBeginPath, nvgCreateFont, nvgCreateGL3, nvgEndFrame, nvgFill, nvgFillPaint, nvgFontFace, nvgFontSize, nvgImagePattern, nvgRect, nvgText, nvglCreateImageFromHandleGL3, NVGpaint};
 use crate::gs::texture::Texture;
 
 pub struct NvgContext {
@@ -10,6 +13,29 @@ impl NvgContext {
         unsafe {
             let context = nvgCreateGL3(0);
             NvgContext { context }
+        }
+    }
+
+    pub fn load_font(&mut self, name: &str, path: &str) {
+        unsafe {
+            let name = CString::from_str(name).unwrap();
+            let path = CString::from_str(path).unwrap();
+            nvgCreateFont(self.context, name.as_ptr(), path.as_ptr());
+        }
+    }
+
+    pub fn set_font(&mut self, name: &str, size: f32) {
+        unsafe {
+            let name = CString::from_str(name).unwrap();
+            nvgFontFace(self.context, name.as_ptr());
+            nvgFontSize(self.context, size);
+        }
+    }
+
+    pub fn text(&mut self, origin: (f32, f32), text: &str) {
+        unsafe {
+            let text = CString::from_str(text).unwrap();
+            nvgText(self.context, origin.0, origin.1, text.as_ptr(), null());
         }
     }
 

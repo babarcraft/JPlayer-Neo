@@ -96,6 +96,12 @@ impl Frame {
         }
     }
 
+    pub fn sample_rate(&self) -> u32 {
+        unsafe {
+            (*self.pointer).sample_rate as u32
+        }
+    }
+
     pub fn channel_layout(&self) -> AVChannelLayout {
         unsafe {
             (*self.pointer).ch_layout
@@ -266,12 +272,14 @@ impl AudioFrame {
         }
     }
 
+    pub fn plane<T>(&self, num: usize) -> &[T] {
+        unsafe {
+            std::slice::from_raw_parts(self.planes[num] as *const T, self.plane_sizes[num].unwrap() / size_of::<T>())
+        }
+    }
+
     pub fn ensure_allocated(&mut self, plane_size: usize, planes: usize) {
         for index in 0..planes {
-            let plane_ptr = &mut self.planes[index];
-            if plane_ptr.is_null() {
-                continue;
-            }
             if let Some(size) = &mut self.plane_sizes[index] {
                 if *size != plane_size {
                     self.planes[index] = unsafe {
@@ -286,7 +294,7 @@ impl AudioFrame {
                 self.plane_sizes[index] = Some(plane_size);
             }
         }
-        for i in self.num_planes..planes.max(self.num_planes) {
+        for i in planes..planes.max(self.num_planes) {
             let plane_ptr = &mut self.planes[i];
             if !plane_ptr.is_null() {
                 unsafe {
@@ -295,6 +303,7 @@ impl AudioFrame {
                 *plane_ptr = null_mut();
             }
         }
+        self.num_planes = planes;
     }
 }
 

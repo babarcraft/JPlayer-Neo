@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::null_mut;
 use cpal::SampleFormat;
-use ffmpeg_sys_next::{av_channel_layout_default, av_get_bytes_per_sample, av_hwdevice_ctx_create, av_sample_fmt_is_planar, avcodec_alloc_context3, avcodec_find_decoder, avcodec_flush_buffers, avcodec_free_context, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_send_packet, swr_alloc_set_opts2, swr_close, swr_convert, swr_free, swr_get_out_samples, AVBufferRef, AVChannelLayout, AVChannelLayout__bindgen_ty_1, AVChannelOrder, AVCodec, AVCodecContext, AVCodecHWConfig, AVHWDeviceType, AVPixelFormat, AVSampleFormat, SwrContext, AVERROR_DECODER_NOT_FOUND, AVERROR_EOF, AVERROR_UNKNOWN};
+use ffmpeg_sys_next::{av_channel_layout_default, av_get_bytes_per_sample, av_hwdevice_ctx_create, av_sample_fmt_is_planar, avcodec_alloc_context3, avcodec_find_decoder, avcodec_flush_buffers, avcodec_free_context, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_send_packet, swr_alloc, swr_alloc_set_opts2, swr_close, swr_convert, swr_free, swr_get_out_samples, swr_init, AVBufferRef, AVChannelLayout, AVChannelLayout__bindgen_ty_1, AVChannelOrder, AVCodec, AVCodecContext, AVCodecHWConfig, AVHWDeviceType, AVPixelFormat, AVSampleFormat, SwrContext, AVERROR_DECODER_NOT_FOUND, AVERROR_EOF, AVERROR_UNKNOWN};
 use crate::ffmpeg::error::Error;
 use crate::ffmpeg::frame::{AudioFrame, Frame};
 use crate::ffmpeg::input::Stream;
@@ -165,7 +165,7 @@ impl AudioConverter {
             };
             av_channel_layout_default(&mut channel_layout, channels as i32);
             AudioConverter {
-                context: null_mut(),
+                context: swr_alloc(),
                 channels,
                 sample_rate,
                 sample_format,
@@ -179,6 +179,10 @@ impl AudioConverter {
     pub fn convert_frame(&mut self, frame: &Frame, dest: &mut AudioFrame) -> Result<(), Error> {
         unsafe {
             let samples_num = frame.num_samples() as i32;
+            if self.context.is_null() {
+                return Err(Error::from_code(-1));
+            }
+
             let result = swr_alloc_set_opts2(
                 &mut self.context,
                 &self.channel_layout,
@@ -186,12 +190,18 @@ impl AudioConverter {
                 self.sample_rate as i32,
                 &frame.channel_layout(),
                 frame.sample_format().unwrap(),
-                samples_num,
+                frame.sample_rate() as i32,
                 0,
                 null_mut()
             );
+
             if result < 0 {
-                return Err(Error::from_code(result))
+                return Err(Error::from_code(result));
+            }
+
+            let result = swr_init(self.context);
+            if result < 0 {
+                return Err(Error::from_code(result));
             }
 
             let samples_out = swr_get_out_samples(self.context, samples_num);
@@ -202,7 +212,9 @@ impl AudioConverter {
                 samples_out as u32 * self.sample_bytes * self.channels
             };
             dest.ensure_allocated(buffer_size as usize, planes as usize);
-            let result = swr_convert(self.context, dest.planes.as_ptr(), samples_out, (*frame.pointer).data.as_ptr() as *const *const u8, samples_num);
+            let src = (*frame.pointer).data.as_ptr() as *const *const u8;
+            let dest_ptr = dest.planes.as_ptr();
+            let result = swr_convert(self.context, dest_ptr, samples_out, src, samples_num);
             if result < 0 {
                 return Err(Error::from_code(result))
             }

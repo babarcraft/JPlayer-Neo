@@ -48,3 +48,9 @@ pub fn mapped_buffer_barrier() {
         gl::MemoryBarrier(gl::CLIENT_MAPPED_BUFFER_BARRIER_BIT);
     }
 }
+
+pub fn clear_current_buffer_color() {
+    unsafe {
+        gl::Clear(gl::COLOR_BUFFER_BIT);
+    }
+}

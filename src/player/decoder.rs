@@ -3,9 +3,14 @@ use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
+use std::time::Instant;
+use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_S16;
+use ffmpeg_sys_next::register_t;
 use crate::ffmpeg::decode::{AudioConverter, Decoder, DecoderResult};
 use crate::ffmpeg::frame::{AudioFrame, Frame};
-use crate::ffmpeg::input::{Input, Stream};
+use crate::ffmpeg::input::{Input, Stream, StreamType};
+use crate::player::clock::{Clock, GenClock};
+use crate::player::decoder::FrameConsumer::{AudioConsumer, VideoConsumer};
 use crate::player::input::{InputWorker, InputWorkerMessage, PacketQueue};
 use crate::player::surface::FrameQueue;
 
@@ -14,22 +19,42 @@ pub struct AudioRingBuffer {
     write_index: usize,
     read_index: usize,
     size: usize,
-    serial: Option<u32>
+
+    serial: Option<u32>,
+    pts: Option<f64>,
+    samples_read: usize,
+    last_read: Option<Instant>,
+    
+    pub latency: Option<f64>,
+
+    pub sample_rate: u32,
+    pub channels: u16,
 }
 
 impl AudioRingBuffer {
-    pub fn new(size: usize) -> AudioRingBuffer {
+    pub fn new(seconds: f32, sample_rate: u32, channels: u16) -> AudioRingBuffer {
+        let size = (seconds * (sample_rate as f32) * (channels as f32)).round() as usize;
         AudioRingBuffer {
+            sample_rate,
+            channels,
+            size,
             buffer: vec![0i16; size],
             write_index: 0,
             read_index: 0,
-            size,
-            serial: None
+            samples_read: 0,
+            pts: None,
+            serial: None,
+            latency: None,
+            last_read: None,
         }
     }
 
     pub fn available(&self) -> usize {
         self.size
+    }
+
+    pub fn remaining_space(&self) -> usize {
+        self.buffer.len() - self.size
     }
 
     pub fn read(&mut self, dest: &mut [i16]) -> usize {
@@ -39,22 +64,27 @@ impl AudioRingBuffer {
             self.read_index = (self.read_index + 1) % self.buffer.len();
             self.size -= 1
         }
+        self.samples_read += to_copy;
         to_copy
     }
 
-    pub fn write(&mut self, src: &[i16], serial: u32) -> usize {
+    pub fn write(&mut self, src: &[i16], pts: f64, serial: u32) -> usize {
         if let Some(current_serial) = self.serial {
             if current_serial != serial {
                 self.serial = Some(current_serial);
+                self.pts = Some(pts);
+
+                self.samples_read = 0;
                 self.size = 0;
                 self.read_index = 0;
                 self.write_index = 0;
             }
         } else {
             self.serial = Some(serial);
+            self.pts = Some(pts);
         }
         
-        let to_copy = src.len().min(self.buffer.len() - self.size);
+        let to_copy = src.len().min(self.remaining_space());
         for i in 0..to_copy {
             self.buffer[self.write_index] = src[i];
             self.write_index = (self.write_index + 1) % self.buffer.len();
@@ -62,9 +92,18 @@ impl AudioRingBuffer {
         }
         to_copy
     }
-    
-    pub fn serial(&self) -> Option<u32> {
+}
+
+impl Clock for AudioRingBuffer {
+    fn serial(&self) -> Option<u32> {
         self.serial
+    }
+
+    fn pts_interpolated(&self) -> Option<f64> {
+        let pts = self.pts?;
+        let read_secs = self.samples_read as f64 / (self.sample_rate as f64 * self.channels as f64);
+        let inter = self.last_read.clone().unwrap_or(Instant::now()).elapsed().as_secs_f64();
+        Some(pts + read_secs + inter + self.latency.unwrap_or(0.0))
     }
 }
 
@@ -72,6 +111,22 @@ impl AudioRingBuffer {
 pub enum FrameConsumer {
     AudioConsumer(Arc<RwLock<AudioRingBuffer>>),
     VideoConsumer(Arc<RwLock<FrameQueue>>),
+}
+
+impl FrameConsumer {
+    pub fn unwrap_video(self) -> Arc<RwLock<FrameQueue>> {
+        match self {
+            FrameConsumer::VideoConsumer(consumer) => consumer,
+            _ => panic!("Frame consumer is not video!"),
+        }
+    }
+
+    pub fn unwrap_audio(self) -> Arc<RwLock<AudioRingBuffer>> {
+        match self {
+            FrameConsumer::AudioConsumer(consumer) => consumer,
+            _ => panic!("Frame consumer is not audio!"),
+        }
+    }
 }
 
 pub enum DecodeWorkerMessage {
@@ -82,10 +137,83 @@ pub enum DecodeWorkerMessage {
 pub struct DecodePair {
     decoder: Decoder,
     packet_queue: (Arc<RwLock<PacketQueue>>, Sender<InputWorkerMessage>),
-    frame_queue: Arc<RwLock<FrameQueue>>,
+    frame_consumer: FrameConsumer,
     audio_frame: Option<AudioFrame>,
+    audio_frame_remaining: usize,
     audio_converter: Option<AudioConverter>,
     needs_input: bool
+}
+
+impl DecodePair {
+    pub fn consumer_has_space(&self) -> bool {
+        match &self.frame_consumer {
+            FrameConsumer::AudioConsumer(ring) => {
+                let remaining_space = {
+                    let ring = ring.read().unwrap();
+                    ring.remaining_space()
+                };
+                if let Some(_) = self.audio_frame.as_ref() {
+                    if remaining_space >= self.audio_frame_remaining {
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                }
+            },
+            FrameConsumer::VideoConsumer(queue) => queue.read().unwrap().has_space(),
+        }
+    }
+
+    pub fn write_received(&mut self, frame: &Frame) {
+        match &mut self.frame_consumer {
+            FrameConsumer::AudioConsumer(ring) => {
+                let audio_frame = self.audio_frame.get_or_insert_with(|| AudioFrame::new());
+                let context = self.audio_converter.as_mut().unwrap();
+                context.convert_frame(frame, audio_frame).unwrap();
+                self.audio_frame_remaining = audio_frame.num_samples;
+
+                let mut ring = ring.write().unwrap();
+                let plane = audio_frame.plane(0);
+                let begin_index = plane.len() - self.audio_frame_remaining;
+                let end_index = begin_index + self.audio_frame_remaining;
+                self.audio_frame_remaining -= ring.write(&plane[begin_index..end_index], frame.pts.unwrap(), frame.serial.unwrap())
+            }
+            FrameConsumer::VideoConsumer(queue) => {
+                let mut queue = queue.write().unwrap();
+                if let Some(dest) = queue.peek_write() {
+                    if self.decoder.is_hardware {
+                        frame.transfer_hw_data_to(dest).unwrap();
+                    } else {
+                        frame.move_to(dest)
+                    }
+                    queue.push();
+                }
+            }
+        }
+    }
+
+    /// Will return whether the decoder should skip decoding this time
+    pub fn write_remaining(&mut self) -> bool {
+        match &mut self.frame_consumer {
+            FrameConsumer::AudioConsumer(ring) => {
+                if self.audio_frame_remaining == 0 {
+                    return false;
+                }
+                let audio_frame = self.audio_frame.get_or_insert_with(|| AudioFrame::new());
+                let mut ring = ring.write().unwrap();
+                let plane = audio_frame.plane(0);
+                let begin_index = plane.len() - self.audio_frame_remaining;
+                let end_index = begin_index + self.audio_frame_remaining;
+                self.audio_frame_remaining -= ring.write(&plane[begin_index..end_index], audio_frame.pts.unwrap(), audio_frame.serial.unwrap());
+                self.audio_frame_remaining > 0
+            }
+            FrameConsumer::VideoConsumer(queue) => {
+                false
+            }
+        }
+    }
 }
 
 pub struct DecodeWorker {
@@ -110,7 +238,7 @@ impl DecodeWorker {
                         let mut decoders = decoders.lock().unwrap();
                         let mut available = decoders.iter_mut()
                             .filter(|pair| {
-                                let frame_queue_space = pair.frame_queue.read().unwrap().has_space();
+                                let frame_queue_space = pair.consumer_has_space();
                                 let packet_queue_space = pair.packet_queue.0.read().unwrap().queued().unwrap_or(0.0);
                                 if pair.needs_input {
                                     frame_queue_space && packet_queue_space > 0.0
@@ -121,20 +249,15 @@ impl DecodeWorker {
                             .peekable();
                         let empty = available.peek().is_none();
                         for pair in available {
+                            if pair.write_remaining() {
+                                continue;
+                            }
                             match pair.decoder.receive_frame(&mut frame) {
                                 DecoderResult::Error(error) => {
                                     println!("Error decoding frame: {:?}", error);
                                 },
                                 DecoderResult::FrameReceived => {
-                                    let mut queue = pair.frame_queue.write().unwrap();
-                                    if let Some(dest) = queue.peek_write() {
-                                        if pair.decoder.is_hardware {
-                                            frame.transfer_hw_data_to(dest).unwrap();
-                                        } else {
-                                            frame.move_to(dest)
-                                        }
-                                        queue.push();
-                                    }
+                                    pair.write_received(&frame);
                                 }
                                 DecoderResult::NeedsInput => {
                                     passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -168,7 +291,7 @@ impl DecodeWorker {
         }
     }
 
-    pub fn begin_decode(&mut self, streams: &Vec<Option<&Stream>>, input: Input, input_worker: &mut InputWorker) -> Vec<Option<(Sender<DecodeWorkerMessage>, Arc<RwLock<FrameQueue>>)>> {
+    pub fn begin_decode(&mut self, streams: &Vec<Option<&Stream>>, audio_config: Option<(u32, u16)>, input: Input, input_worker: &mut InputWorker) -> Vec<Option<(Sender<DecodeWorkerMessage>, FrameConsumer)>> {
         let queues = streams.iter().map(|stream| {
             if let Some(stream) = stream {
                 Some((*stream, self.sender.clone()))
@@ -188,16 +311,39 @@ impl DecodeWorker {
                 Some(queue) => queue,
                 None => continue,
             };
-            let frame_queue = Arc::new(RwLock::new(FrameQueue::new(15)));
-            decoders.push(DecodePair {
-                decoder: Decoder::new(stream, vec![]).unwrap(),
-                packet_queue: (queue.clone(), sender.clone()),
-                frame_queue: frame_queue.clone(),
-                audio_converter: None,
-                audio_frame: None,
-                needs_input: true
-            });
-            out_queues[stream.index as usize] = Some((self.sender.clone(), frame_queue));
+
+            let pair = match stream.stream_type {
+                StreamType::Audio => {
+                    let (sample_rate, channels) = audio_config.expect("Missing audio config");
+                    let frame_queue = AudioConsumer(Arc::new(RwLock::new(AudioRingBuffer::new(0.5, sample_rate, channels))));
+                    let converter = AudioConverter::new(channels as u32, sample_rate, AV_SAMPLE_FMT_S16);
+                    DecodePair {
+                        decoder: Decoder::new(stream, vec![]).unwrap(),
+                        packet_queue: (queue.clone(), sender.clone()),
+                        frame_consumer: frame_queue,
+                        audio_converter: Some(converter),
+                        audio_frame: Some(AudioFrame::new()),
+                        audio_frame_remaining: 0,
+                        needs_input: true
+                    }
+                },
+                StreamType::Video => {
+                    let frame_queue = VideoConsumer(Arc::new(RwLock::new(FrameQueue::new(15))));
+                    DecodePair {
+                        decoder: Decoder::new(stream, vec![]).unwrap(),
+                        packet_queue: (queue.clone(), sender.clone()),
+                        frame_consumer: frame_queue,
+                        audio_converter: None,
+                        audio_frame: None,
+                        audio_frame_remaining: 0,
+                        needs_input: true
+                    }
+                },
+                _ => continue,
+            };
+            out_queues[stream.index as usize] = Some((self.sender.clone(), pair.frame_consumer.clone()));
+            decoders.push(pair);
+
         }
         out_queues
     }

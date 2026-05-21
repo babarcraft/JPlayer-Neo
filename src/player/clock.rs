@@ -1,12 +1,17 @@
 use std::time::Instant;
 
-pub struct Clock {
+pub trait Clock {
+    fn serial(&self) -> Option<u32>;
+    fn pts_interpolated(&self) -> Option<f64>;
+}
+
+pub struct GenClock {
     pts: Option<f64>,
     last_update: Option<Instant>,
     serial: Option<u32>
 }
 
-impl Clock {
+impl GenClock {
     pub fn new() -> Self {
         Self {
             pts: None,
@@ -21,6 +26,11 @@ impl Clock {
         self.serial = Some(serial);
     }
 
+    pub fn clear(&mut self) {
+        self.pts = None;
+        self.last_update = None;
+    }
+
     pub fn pts_interpolated(&self) -> Option<f64> {
         if let Some(pts) = self.pts {
             if let Some(last_update) = self.last_update {
@@ -28,6 +38,10 @@ impl Clock {
             }
         }
         None
+    }
+
+    pub fn pts(&self) -> Option<f64> {
+        self.pts
     }
 
     pub fn serial(&self) -> Option<u32> {

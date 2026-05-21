@@ -51,6 +51,10 @@ impl FrameQueue {
         let frame = &self.frames[self.read_index];
         Some(frame)
     }
+    
+    pub fn queued(&self) -> usize {
+        self.size
+    }
 
     pub fn pop(&mut self) {
         self.read_index = (self.read_index + 1) % self.frames.len();
