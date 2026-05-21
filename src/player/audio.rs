@@ -24,7 +24,7 @@ impl AudioDevice {
             let channels = buffer.channels;
             let sample_rate = buffer.sample_rate;
             let buffer_size = 128 * channels as u32;
-            buffer.latency = Some(- (buffer_size as f64 / sample_rate as f64));
+            // buffer.latency = Some((buffer_size as f64 / sample_rate as f64));
             StreamConfig {
                 channels,
                 sample_rate,

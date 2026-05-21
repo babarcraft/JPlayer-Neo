@@ -67,12 +67,6 @@ impl Window {
                         }
                     }
                     glfw::WindowEvent::Size(w, h) => {
-                        if !manual_change {
-                            self.window.set_size(h / 4, h);
-                            manual_change = true;
-                        } else {
-                            manual_change = false;
-                        }
                     }
                     _ => {}
                 }

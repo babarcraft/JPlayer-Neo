@@ -24,7 +24,7 @@ pub struct AudioRingBuffer {
     pts: Option<f64>,
     samples_read: usize,
     last_read: Option<Instant>,
-    
+
     pub latency: Option<f64>,
 
     pub sample_rate: u32,
@@ -59,12 +59,12 @@ impl AudioRingBuffer {
 
     pub fn read(&mut self, dest: &mut [i16]) -> usize {
         let to_copy = dest.len().min(self.size);
+        self.samples_read += to_copy;
         for i in 0..to_copy {
             dest[i] = self.buffer[self.read_index];
             self.read_index = (self.read_index + 1) % self.buffer.len();
             self.size -= 1
         }
-        self.samples_read += to_copy;
         to_copy
     }
 

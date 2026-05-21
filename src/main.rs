@@ -50,7 +50,7 @@ impl App {
 
 impl App {
     pub fn new() -> Self {
-        let input = Input::open("test.webm", vec![]).unwrap();
+        let input = Input::open("test.mp4", vec![]).unwrap();
 
         let audio_stream = input
             .streams
