@@ -19,6 +19,8 @@ pub struct PacketQueue {
     timebase: f64,
     begin_pts: Option<f64>,
     end_pts: Option<f64>,
+    serial: Option<u32>,
+    closed: bool,
 }
 
 impl PacketQueue {
@@ -27,11 +29,25 @@ impl PacketQueue {
             queue: VecDeque::new(),
             begin_pts: None,
             end_pts: None,
-            timebase: stream.timebase
+            serial: None,
+            timebase: stream.timebase,
+            closed: false,
         }
+    }
+
+    pub fn serial(&self) -> Option<u32> {
+        self.serial
     }
     
     pub fn push(&mut self, packet: Packet) {
+        if let Some(serial) = self.serial {
+            if serial != packet.serial {
+                self.queue.clear();
+                self.serial = Some(packet.serial);
+            }
+        } else {
+            self.serial = Some(packet.serial);
+        }
         let pts = packet.pts();
         if pts != AV_NOPTS_VALUE {
             let pts = self.timebase * (pts as f64);
@@ -53,9 +69,13 @@ impl PacketQueue {
             None
         }
     }
-    
+
     pub fn queued(&self) -> Option<f64> {
         Some(self.end_pts? - self.begin_pts?)
+    }
+
+    pub fn close(&mut self) {
+        self.closed = true;
     }
 }
 
@@ -64,9 +84,14 @@ pub enum InputWorkerMessage {
     Update
 }
 
+pub enum InputCommand {
+    Seek(f64, f64, Option<i32>)
+}
+
 pub struct InputPair {
-    input: Arc<Mutex<Input>>,
+    input: Input,
     queue: Vec<Option<(Arc<RwLock<PacketQueue>>, Sender<DecodeWorkerMessage>)>>,
+    receiver: Receiver<InputCommand>,
 }
 
 impl InputPair {
@@ -103,6 +128,17 @@ impl InputWorker {
                 loop {
                     loop {
                         let mut inputs = inputs.lock().unwrap();
+                        inputs.retain(|pair| pair.queue.iter().all(|queue| {
+                            if let Some((queue, sender)) = queue {
+                                let closed = queue.read().unwrap().closed;
+                                if closed {
+                                    println!("Packet queue closed!")
+                                }
+                                !closed
+                            } else {
+                                true
+                            }
+                        }));
                         inputs.sort_by(|pair_a, pair_b| {
                             pair_a.average_queued().total_cmp(&pair_b.average_queued())
                         });
@@ -112,13 +148,22 @@ impl InputWorker {
                         passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let empty = available.peek().is_none();
                         for pair in inputs.iter_mut() {
-                            let mut input = pair.input.lock().unwrap();
+                            let input = &mut pair.input;
+                            while let Some(command) = pair.receiver.try_recv().ok() {
+                                match command {
+                                    InputCommand::Seek(min, max, stream) => {
+                                        input.seek(min, max, stream).unwrap();
+                                        println!("Seek")
+                                    }
+                                }
+                            }
+
                             if let Some(packet) = input.read_packet().ok() {
                                 if let Some((queue, sender)) = &pair.queue[packet.stream_index() as usize] {
                                     let mut queue = queue.write().unwrap();
                                     let last = queue.queued().unwrap_or(0.0);
                                     queue.push(packet);
-                                    sender.send(DecodeWorkerMessage::Wakeup).unwrap();
+                                    sender.send(DecodeWorkerMessage::Wakeup("New input")).unwrap();
                                 }
                             }
                         }
@@ -139,7 +184,7 @@ impl InputWorker {
         }
     }
 
-    pub fn add_input(&mut self, input: Input, mut queues: Vec<Option<(&Stream, Sender<DecodeWorkerMessage>)>>) -> (Vec<Option<Arc<RwLock<PacketQueue>>>>, Sender<InputWorkerMessage>) {
+    pub fn add_input(&mut self, input: Input, mut queues: Vec<Option<(&Stream, Sender<DecodeWorkerMessage>)>>) -> (Vec<Option<Arc<RwLock<PacketQueue>>>>, Sender<InputWorkerMessage>, Sender<InputCommand>) {
         let mut inputs = self.inputs.lock().unwrap();
         for _ in 0..(queues.len() - input.streams.len()) {
             queues.push(None);
@@ -158,12 +203,14 @@ impl InputWorker {
                 None
             }
         }).collect::<Vec<_>>();
+        let (sender, receiver) = mpsc::channel::<InputCommand>();
         inputs.push(InputPair {
-            input: Arc::new(Mutex::new(input)),
+            input,
             queue: pair_queues,
+            receiver
         });
         self.sender.send(InputWorkerMessage::Update).unwrap();
 
-        (queues, self.sender.clone())
+        (queues, self.sender.clone(), sender)
     }
 }

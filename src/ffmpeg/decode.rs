@@ -115,12 +115,13 @@ impl Decoder {
             if let Some(serial) = self.serial {
                 if serial != packet.serial {
                     avcodec_flush_buffers(self.context);
-                    self.serial = Some(serial);
+                    self.serial = Some(packet.serial);
                 }
             } else {
                 avcodec_flush_buffers(self.context);
                 self.serial = Some(packet.serial);
             }
+
             let result = avcodec_send_packet(self.context, packet.pointer);
             if result < 0 {
                 Err(Error::from_code(result))

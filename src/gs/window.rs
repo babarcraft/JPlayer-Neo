@@ -8,6 +8,7 @@ use crate::gs::shader::UniformValue;
 pub trait WindowHandler {
     fn initialize(&mut self, window: &mut Window);
     fn render(&mut self, dt: f32, window: &mut Window);
+    fn handle_key(&mut self, key: Key, action: Action, window: &Window);
 }
 
 pub struct Window {
@@ -55,8 +56,8 @@ impl Window {
 
             for (_, event) in glfw::flush_messages(&self.events) {
                 match event {
-                    glfw::WindowEvent::Key(Key::Escape, _, Action::Press, _) => {
-                        self.window.set_should_close(true)
+                    glfw::WindowEvent::Key(key, _scancode, action, _mods) => {
+                        handler.handle_key(key, action, self);
                     }
                     glfw::WindowEvent::Char(character) => {
                         println!("{}", character);
@@ -83,6 +84,10 @@ impl Window {
 
             self.window.swap_buffers();
         }
+    }
+
+    pub fn get_clipboard(&self) -> Option<String> {
+        self.window.get_clipboard_string()
     }
 
     pub fn get_size(&self) -> (f32, f32) {

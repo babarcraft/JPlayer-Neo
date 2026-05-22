@@ -2,22 +2,26 @@ mod ffmpeg;
 pub mod gs;
 pub mod player;
 
+use std::cell::RefCell;
 use crate::ffmpeg::frame::Frame;
 use crate::ffmpeg::input::{Input, Stream, StreamType};
 use crate::gs::nvg::NvgContext;
 use crate::gs::texture::InternalFormat;
 use crate::gs::window::{Window, WindowHandler};
 use crate::player::decoder::{DecodeWorker, DecodeWorkerMessage};
-use crate::player::input::InputWorker;
+use crate::player::input::{InputCommand, InputWorker};
 use crate::player::surface::{FrameQueue, VideoSurface};
-use glfw::Context;
+use glfw::{Action, Context, Key};
 use std::ops::Div;
+use std::rc::Rc;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use cpal::traits::{DeviceTrait, HostTrait};
 use nanovg_sys::nvgFontFace;
 use crate::gs::gl::clear_current_buffer_color;
+use player::player::VideoPlayback;
 use crate::player::audio::AudioDevice;
 use crate::player::clock::Clock;
 
@@ -25,21 +29,15 @@ struct App {
     frame_sw: Frame,
     input_worker: InputWorker,
     decode_worker: DecodeWorker,
-    device: AudioDevice,
-    sender: Sender<DecodeWorkerMessage>,
-    frame_queue: Arc<RwLock<FrameQueue>>,
-    video_surface: VideoSurface,
-    nvg_context: NvgContext,
+    video_surface: Rc<RefCell<VideoSurface>>,
+    video_playback: Option<VideoPlayback>,
+    audio_device: Option<AudioDevice>,
+    command_sender: Option<Sender<InputCommand>>,
     nvg_image: Option<i32>,
-    num_frames: usize,
-    num_fq_fail: usize,
-    num_cl_fail: usize,
-    num_dropped: usize,
-    num_begin: Instant,
+    nvg_context: NvgContext,
     begin: Instant,
-    last_pts: Option<f64>,
-    last_duration: f64,
-    frame_timer: Option<f64>,
+    last_decode_passes: usize,
+    last_input_passes: usize,
 }
 
 impl App {
@@ -50,37 +48,9 @@ impl App {
 
 impl App {
     pub fn new() -> Self {
-        let input = Input::open("test.mp4", vec![]).unwrap();
-
-        let audio_stream = input
-            .streams
-            .iter()
-            .find(|stream| stream.stream_type == StreamType::Audio)
-            .unwrap()
-            .clone();
-        let video_stream = input
-            .streams
-            .iter()
-            .find(|stream| stream.stream_type == StreamType::Video)
-            .unwrap()
-            .clone();
-        let mut queues: Vec<Option<&Stream>> = (0..input.streams.len()).map(|_| None).collect();
-        queues[video_stream.index as usize] = Some(&video_stream);
-        queues[audio_stream.index as usize] = Some(&audio_stream);
-        let mut decode_worker = DecodeWorker::new();
-        let mut input_worker = InputWorker::new();
-        let mut decode_streams = decode_worker.begin_decode(&queues, Some((44100, 1)), input, &mut input_worker);
-
-        let mut device = {
-            let (sender, queue) = decode_streams[audio_stream.index as usize].take().unwrap();
-            AudioDevice::default_device(queue.unwrap_audio(), sender).unwrap()
-        };
-
-        device.play();
-
-        let (sender, queue) = decode_streams[video_stream.index as usize].take().unwrap();
 
         let surface = VideoSurface::new();
+        let video_surface = Rc::new(RefCell::new(surface));
         let mut nvg_context = NvgContext::new();
 
         nvg_context.load_font("default", "src/res/def.ttf");
@@ -88,23 +58,17 @@ impl App {
 
         Self {
             frame_sw: Frame::new(),
-            video_surface: surface,
-            sender,
-            frame_queue: queue.unwrap_video(),
-            device,
-            input_worker,
-            decode_worker,
-            nvg_context,
+            video_surface,
+            video_playback: None,
+            audio_device: None,
             nvg_image: None,
-            num_frames: 0,
-            num_cl_fail: 0,
-            num_dropped: 0,
-            num_fq_fail: 0,
-            last_pts: None,
-            last_duration: 0.0,
-            frame_timer: None,
+            command_sender: None,
+            input_worker: InputWorker::new(),
+            decode_worker: DecodeWorker::new(),
+            nvg_context,
             begin: Instant::now(),
-            num_begin: Instant::now(),
+            last_decode_passes: 0,
+            last_input_passes: 0,
         }
     }
 }
@@ -115,109 +79,24 @@ impl WindowHandler for App {
     fn render(&mut self, dt: f32, window: &mut Window) {
         clear_current_buffer_color();
 
-        let current_time = self.begin.elapsed().as_secs_f64();
-
-        let audio_clock = self.device.ring_buffer.try_read().ok()
-            .and_then(|ring| ring.pts_interpolated())
-            .unwrap_or(0.0) as f64;
-
-        let mut should_pop = false;
-        let mut queue_was_full = false;
-
-        let mut av = 0.0;
-        let mut frame_num = 0;
-
-        if let Some(queue) = self.frame_queue.try_read().ok() {
-            queue_was_full = !queue.has_space();
-            frame_num = queue.queued();
-
-            if let Some(frame) = queue.peek_read() {
-                let current_pts = frame.pts.unwrap_or(0.0) as f64;
-                av = audio_clock - current_pts;
-
-                if self.frame_timer.is_none() || self.last_pts.is_none() {
-                    self.frame_timer = Some(current_time);
-                    self.last_pts = Some(current_pts);
-                    self.last_duration = frame.duration.unwrap_or(0.04) as f64;
-
-                    self.video_surface.upload(frame, &[
-                        InternalFormat::R(8),
-                        InternalFormat::Rg(8),
-                    ], Some(2));
-                    self.video_surface.convert_output();
-                    self.nvg_image.get_or_insert_with(|| {
-                        self.nvg_context.create_texture_image(&self.video_surface.output_texture)
-                    });
-                    self.num_frames += 1;
-                    should_pop = true;
-                } else {
-                    let last_pts = self.last_pts.unwrap();
-
-                    let mut duration = current_pts - last_pts;
-                    if duration <= 0.0 || duration > 1.0 {
-                        duration = self.last_duration; // fallback to previous valid entry
-                    }
-
-                    let diff = current_pts - audio_clock;
-                    let sync_threshold = 0.04_f64.max(0.1_f64.min(duration));
-
-                    let mut delay = duration;
-                    if diff.abs() < 3600.0 {
-                        if diff <= -sync_threshold {
-                            delay = 0.0_f64.max(duration + diff);
-                        } else if diff >= sync_threshold {
-                            delay = duration + diff;
-                        }
-                    }
-
-                    let target_time = self.frame_timer.unwrap() + delay;
-
-                    if current_time < target_time {
-                    } else {
-                        self.frame_timer = Some(target_time);
-
-                        if current_time - target_time > 0.1 {
-                            self.frame_timer = Some(current_time);
-                        }
-
-                        if diff < -0.1 {
-                            self.num_dropped += 1;
-                            should_pop = true;
-                        } else {
-                            self.video_surface.upload(frame, &[
-                                InternalFormat::R(8),
-                                InternalFormat::Rg(8),
-                            ], Some(2));
-                            self.video_surface.convert_output();
-                            self.nvg_image.get_or_insert_with(|| {
-                                self.nvg_context.create_texture_image(&self.video_surface.output_texture)
-                            });
-                            self.num_frames += 1;
-                            self.last_pts = Some(current_pts);
-                            self.last_duration = duration;
-                            should_pop = true;
-                        }
-                    }
-                }
-            }
-        } else {
-            self.num_fq_fail += 1;
+        if let Some(playback) = self.video_playback.as_mut() {
+            playback.update();
+        }
+        let mut video_surface = self.video_surface.borrow_mut();
+        if let Some((width, height)) = video_surface.size_update.take() {
+            self.nvg_image = Some(self.nvg_context.create_texture_image(&video_surface.output_texture));
         }
 
-        // 4. If the logic determined we need to pop, acquire the write lock safely outside our read block
-        if should_pop {
-            if let Some(mut write_queue) = self.frame_queue.try_write().ok() {
-                write_queue.pop();
-                if queue_was_full {
-                    let _ = self.sender.send(DecodeWorkerMessage::Wakeup);
-                }
-            }
+        if let Some(serial) = self.audio_device.as_ref()
+            .and_then(|device| device.ring_buffer.read().ok()
+                .and_then(|ring| ring.serial())) {
         }
+
         let (w, h) = window.get_size();
         self.nvg_context.frame((w, h), |context| {
             if let Some(image) = self.nvg_image {
-                let vw = self.video_surface.output_texture.width.unwrap() as f32;
-                let vh = self.video_surface.output_texture.height.unwrap() as f32;
+                let vw = video_surface.output_texture.width.unwrap() as f32;
+                let vh = video_surface.output_texture.height.unwrap() as f32;
                 let s = (w / vw).min(h / vh);
 
                 let pw = s * vw;
@@ -232,15 +111,108 @@ impl WindowHandler for App {
                 context.fill();
 
                 context.begin_path();
-                let elapsed = self.num_begin.elapsed().as_secs().max(1) as usize;
-                context.text((10.0, 10.0), format!("FPS: {}", self.num_frames / elapsed).as_str());
-                context.text((10.0, 30.0), format!("FQF: {}", self.num_fq_fail / elapsed).as_str());
-                context.text((10.0, 50.0), format!("CLF: {}", self.num_cl_fail / elapsed).as_str());
-                context.text((10.0, 70.0), format!("DPS: {}", self.num_dropped / elapsed).as_str());
-                context.text((10.0, 90.0), format!("A-V diff: {:.2}", av).as_str());
-                context.text((10.0, 110.0), format!("Frame queue size: {}", frame_num).as_str());
+                let current_decode = self.decode_worker.passes.load(Ordering::Relaxed);
+                let current_input = self.input_worker.passes.load(Ordering::Relaxed);
+                context.text((100.0, 100.0), format!("Rate of Input pass {:.2}", (current_decode as f64/ 1000f64) / self.begin.elapsed().as_secs_f64()).as_str());
+                context.text((100.0, 120.0), format!("Rate of Input pass {:.2}", (current_input as f64/ 1000f64) / self.begin.elapsed().as_secs_f64()).as_str());
+                let playback_data = self.video_playback.as_ref().map(|play| (play.seek.unwrap_or(-1.0), play.last_pts.unwrap_or(-1.0))).unwrap_or((-1.0, -1.0));
+                context.text((100.0, 140.0), format!("Amount buffered {:.2}", self.audio_device.as_ref().map(|device| device.ring_buffer.read().unwrap().buffered()).unwrap_or(0.0)).as_str());
+
+                let mut offset = 160.0;
+                for (name, num) in self.decode_worker.wake_ups.read().unwrap().iter() {
+                    context.text((100.0, offset), format!("Rate of {} {:.2}", *name, (*num as f64) / self.begin.elapsed().as_secs_f64()).as_str());
+                    offset += 20.0;
+                }
+
+                self.last_decode_passes = current_decode;
+                self.last_input_passes = current_input;
             }
         });
+    }
+
+    fn handle_key(&mut self, key: Key, action: Action, window: &Window) {
+        match key {
+            Key::Escape => {
+                if action == Action::Press {
+                    self.video_playback.take();
+                    self.audio_device.take();
+                    self.command_sender.take();
+                }
+            }
+            Key::Enter => {
+                if action == Action::Press {
+                    let input = Input::open("test.mp4", vec![]).unwrap();
+
+                    let audio_stream = input
+                        .streams
+                        .iter()
+                        .find(|stream| stream.stream_type == StreamType::Audio)
+                        .unwrap()
+                        .clone();
+                    let video_stream = input
+                        .streams
+                        .iter()
+                        .find(|stream| stream.stream_type == StreamType::Video)
+                        .unwrap()
+                        .clone();
+
+                    let mut queues: Vec<Option<&Stream>> = (0..input.streams.len()).map(|_| None).collect();
+                    queues[video_stream.index as usize] = Some(&video_stream);
+                    queues[audio_stream.index as usize] = Some(&audio_stream);
+                    let (mut decode_streams, command_sender) = self.decode_worker.begin_decode(&queues, Some((44100, 1)), input, &mut self.input_worker);
+
+                    let mut device = {
+                        let (sender, queue) = decode_streams[audio_stream.index as usize].take().unwrap();
+                        AudioDevice::default_device(queue.unwrap_audio(), sender).unwrap()
+                    };
+
+                    let (sender, queue) = decode_streams[video_stream.index as usize].take().unwrap();
+                    let playback = VideoPlayback::new(queue.unwrap_video(), sender, self.video_surface.clone(), device.ring_buffer.clone());
+                    self.video_playback = Some(playback);
+                    self.audio_device = Some(device);
+                    self.command_sender = Some(command_sender);
+                }
+            }
+            Key::Right => {
+                if action == Action::Press {
+                    if let Some(sender) = &self.command_sender {
+                        if let Some(device) = &self.audio_device {
+                            let mut ring = device.ring_buffer.write().unwrap();
+                            let target = ring.pts_interpolated().unwrap_or(0.0) + 5.0;
+                            sender.send(InputCommand::Seek(0.0, target, None)).unwrap();
+                        }
+                    }
+                }
+            }
+            Key::Left => {
+                if action == Action::Press {
+                    if let Some(sender) = &self.command_sender {
+                        if let Some(device) = &self.audio_device {
+                            let mut ring = device.ring_buffer.write().unwrap();
+                            let target = ring.pts_interpolated().unwrap_or(0.0) - 5.0;
+                            sender.send(InputCommand::Seek(0.0, target, None)).unwrap();
+                        }
+                    }
+                }
+            }
+
+            Key::Space => {
+                if action == Action::Press {
+                    if let Some(device) = &mut self.audio_device {
+                        if let Some(playback) = self.video_playback.as_mut() {
+                            if device.is_playing() {
+                                device.pause();
+                                playback.playing = false;
+                            } else {
+                                device.play();
+                                playback.playing = true;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 

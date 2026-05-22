@@ -10,6 +10,8 @@ pub struct FrameQueue {
     size: usize,
     read_index: usize,
     write_index: usize,
+    serial: Option<u32>,
+    pub closed: bool
 }
 
 impl FrameQueue {
@@ -19,6 +21,8 @@ impl FrameQueue {
             size: 0,
             read_index: 0,
             write_index: 0,
+            serial: None,
+            closed: false
         }
     }
 
@@ -30,21 +34,54 @@ impl FrameQueue {
         self.size
     }
 
-    pub fn peek_write(&mut self) -> Option<&mut Frame> {
-        if self.size >= self.frames.len() {
+    pub fn serial(&self) -> Option<u32> {
+        self.serial
+    }
+
+    pub fn peek_write(&mut self, frame_serial: u32) -> Option<&mut Frame> {
+        self.check_and_update_serial(frame_serial);
+
+        if self.size >= self.frames.len() || self.closed {
             return None;
         }
 
         Some(&mut self.frames[self.write_index])
     }
 
+    fn check_and_update_serial(&mut self, frame_serial: u32) {
+        if let Some(serial) = self.serial {
+            if frame_serial != serial {
+                self.read_index = self.write_index;
+                self.size = 0;
+                self.serial = Some(frame_serial);
+                println!("Reset")
+            }
+        } else {
+            self.serial = Some(frame_serial);
+        }
+    }
+    
+    pub fn clear(&mut self) {
+        self.size = 0;
+        self.read_index = 0;
+        self.write_index = 0;
+    }
+    
+    pub fn last_frame(&self) -> Option<&Frame> {
+        self.frames.last()
+    }
+
     pub fn push(&mut self) {
+        let frame = &self.frames[self.write_index];
+        if let Some(frame_serial) = frame.serial {
+            self.check_and_update_serial(frame_serial);
+        }
         self.write_index = (self.write_index + 1) % self.frames.len();
         self.size += 1;
     }
 
     pub fn peek_read(&self) -> Option<&Frame> {
-        if self.size <= 0 {
+        if self.size <= 0 || self.closed {
             return None;
         }
 
@@ -59,6 +96,10 @@ impl FrameQueue {
     pub fn pop(&mut self) {
         self.read_index = (self.read_index + 1) % self.frames.len();
         self.size -= 1;
+    }
+
+    pub fn close(&mut self) {
+        self.closed = true;
     }
 }
 
@@ -148,7 +189,8 @@ pub struct VideoSurface {
     upload_textures: [Texture; 3],
     pub output_texture: Texture,
     compute_shader: Option<Shader>,
-    shader_planes: usize
+    shader_planes: usize,
+    pub size_update: Option<(f32, f32)>
 }
 
 impl VideoSurface {
@@ -165,6 +207,7 @@ impl VideoSurface {
                 Texture::new(),
             ],
             output_texture: Texture::new(),
+            size_update: None,
             compute_shader: None,
             shader_planes: 0,
             size: 0,
@@ -200,6 +243,7 @@ impl VideoSurface {
         let desc = slot.uploaded_planes_dimensions[0];
         if !self.output_texture.has_space(desc.width, desc.height, InternalFormat::Rgba(8)) {
             self.output_texture.bind(Some(0));
+            self.size_update = Some((desc.width as f32, desc.height as f32));
             self.output_texture.upload(None, None, desc.width, desc.height, InternalFormat::Rgba(8));
             self.output_texture.set_parameters(
                 gl::LINEAR,

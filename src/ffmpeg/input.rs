@@ -1,6 +1,6 @@
 use crate::ffmpeg;
 use crate::ffmpeg::error::Error;
-use ffmpeg_sys_next::{av_dict_set, av_dump_format, av_q2d, av_read_frame, avcodec_parameters_alloc, avcodec_parameters_copy, avcodec_parameters_free, avformat_find_stream_info, AVCodecParameters, AVMediaType, AVRational, AVStream};
+use ffmpeg_sys_next::{av_dict_set, av_dump_format, av_q2d, av_read_frame, avcodec_parameters_alloc, avcodec_parameters_copy, avcodec_parameters_free, avformat_find_stream_info, avformat_seek_file, AVCodecParameters, AVMediaType, AVRational, AVStream};
 use ffmpeg_sys_next::avformat_alloc_context;
 use ffmpeg_sys_next::avformat_close_input;
 use ffmpeg_sys_next::avformat_open_input;
@@ -141,6 +141,28 @@ impl Input {
             return Err(error);
         }
         Ok(packet)
+    }
+
+    pub fn seek(&mut self, min: f64, max: f64, stream_index: Option<i32>) -> Result<(), Error> {
+        let (min_ts, max_ts, stream_index) = stream_index.and_then(|index| {
+            let base = self.streams[index as usize].timebase;
+            Some(((min / base) as i64, (max / base) as i64, index))
+        }).unwrap_or(((min * ffmpeg_sys_next::AV_TIME_BASE as f64) as i64, (max * ffmpeg_sys_next::AV_TIME_BASE as f64) as i64, -1));
+        unsafe {
+            let result = avformat_seek_file(
+                self.context,
+                stream_index,
+                min_ts,
+                max_ts,
+                max_ts,
+                ffmpeg_sys_next::AVSEEK_FLAG_BACKWARD
+            );
+            if result < 0 {
+                return Err(Error::from_code(result));
+            }
+            self.serial += 1;
+            Ok(())
+        }
     }
 }
 

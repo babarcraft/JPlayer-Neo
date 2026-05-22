@@ -85,7 +85,7 @@ impl Frame {
                 return Err(Error::from_code(result))
             }
             other.timebase = self.timebase;
-            other.update_data(other.serial);
+            other.update_data(self.serial);
             Ok(())
         }
     }
@@ -203,7 +203,7 @@ impl Frame {
             av_frame_move_ref(other.pointer, self.pointer);
         }
         other.timebase = self.timebase;
-        other.update_data(other.serial);
+        other.update_data(self.serial);
     }
 
     pub fn unref(&mut self) {
