@@ -94,4 +94,19 @@ impl NvgContext {
             nvgRect(self.context, origin.0, y, size.0, size.1);
         }
     }
+    
+    pub fn width(&self, p: Option<f32>) -> f32 {
+        self.size.0 * p.unwrap_or(1.0)
+    }
+    
+    pub fn height(&self, p: Option<f32>) -> f32 {
+        self.size.1 * p.unwrap_or(1.0)
+    }
+    
+    pub fn relative(&self, px: f32, py: f32) -> (f32, f32) {
+        (self.width(Some(px)), self.height(Some(py)))
+    }
+    
+    pub fn rect_p(&mut self, origin: (f32, f32), size: (f32, f32)) {
+    }
 }

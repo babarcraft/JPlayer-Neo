@@ -154,6 +154,12 @@ impl Clock for AudioRingClock {
         self.serial.load(Ordering::SeqCst)
     }
 
+    fn pts(&self) -> f64 {
+        let pts: f64 = unsafe { transmute(self.pts.load(Ordering::SeqCst)) };
+        let read_secs = self.samples_read.load(Ordering::SeqCst) as f64 / (self.sample_rate as f64 * self.channels as f64);
+        pts + read_secs
+    }
+
     fn pts_interpolated(&self) -> f64 {
         let pts: f64 = unsafe { transmute(self.pts.load(Ordering::SeqCst)) };
         let read_secs = self.samples_read.load(Ordering::SeqCst) as f64 / (self.sample_rate as f64 * self.channels as f64);
@@ -435,7 +441,7 @@ impl DecodeWorker {
                     let frame_queue = AudioConsumer(Arc::new(RwLock::new(AudioRingBuffer::new(0.5, sample_rate, channels))));
                     let converter = AudioConverter::new(channels as u32, sample_rate, AV_SAMPLE_FMT_S16);
                     DecodePair {
-                        decoder: Decoder::new(stream, vec![]).unwrap(),
+                        decoder: Decoder::new(stream, &[]).unwrap(),
                         packet_queue: (queue.clone(), worker_sender.clone()),
                         frame_consumer: frame_queue,
                         audio_converter: Some(converter),
@@ -447,7 +453,7 @@ impl DecodeWorker {
                 StreamType::Video => {
                     let frame_queue = VideoConsumer(Arc::new(RwLock::new(FrameQueue::new(15))));
                     DecodePair {
-                        decoder: Decoder::new(stream, vec![]).unwrap(),
+                        decoder: Decoder::new(stream, &[]).unwrap(),
                         packet_queue: (queue.clone(), worker_sender.clone()),
                         frame_consumer: frame_queue,
                         audio_converter: None,

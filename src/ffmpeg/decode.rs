@@ -57,7 +57,7 @@ fn get_hardware_pix_format(codec: *const AVCodec) -> Option<(AVHWDeviceType, AVP
 }
 
 impl Decoder {
-    pub fn new(stream: &Stream, options: Vec<(&str, &str)>) -> Result<Decoder, Error> {
+    pub fn new(stream: &Stream, options: &[(&str, &str)]) -> Result<Decoder, Error> {
         unsafe {
             let parameters = stream.parameters;
             let codec = avcodec_find_decoder((*parameters).codec_id);

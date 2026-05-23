@@ -3,9 +3,12 @@ use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::sync::mpsc::Sender;
 use std::time::Instant;
+use crate::ffmpeg::input::{Input, Stream, StreamType};
 use crate::gs::texture::InternalFormat;
+use crate::player::audio::AudioDevice;
 use crate::player::clock::Clock;
-use crate::player::decoder::DecodeWorkerMessage;
+use crate::player::decoder::{DecodeWorker, DecodeWorkerMessage};
+use crate::player::input::{InputCommand, InputWorker};
 use crate::player::surface::{FrameQueue, VideoSurface};
 
 pub struct VideoPlayback {
@@ -180,5 +183,120 @@ impl Drop for VideoPlayback {
 }
 
 pub struct VideoPlayer {
+    pub video_playback: Option<VideoPlayback>,
+    pub audio_device: Option<AudioDevice>,
+    pub video_stream: Option<Stream>,
+    pub audio_stream: Option<Stream>,
+    pub master_clock: Box<dyn Clock>,
+    pub estimated_duration: f64,
 
+    input_command_sender: Sender<InputCommand>
+}
+
+impl VideoPlayer {
+    pub fn new(input: Input, video_surface: Option<Rc<RefCell<VideoSurface>>>, decode_worker: &mut DecodeWorker, input_worker: &mut InputWorker) -> VideoPlayer {
+        let audio_stream = input
+            .streams
+            .iter()
+            .find(|stream| stream.stream_type == StreamType::Audio)
+            .cloned();
+        let video_stream = input
+            .streams
+            .iter()
+            .find(|stream| stream.stream_type == StreamType::Video)
+            .cloned();
+        let mut playback_clock: Option<Box<dyn Clock>> = None;
+        let mut master_clock: Option<Box<dyn Clock>> = None;
+        let mut queues: Vec<Option<&Stream>> = (0..input.streams.len()).map(|_| None).collect();
+        if let Some(video_stream) = &video_stream {
+            queues[video_stream.index as usize] = Some(video_stream);
+        }
+        if let Some(audio_stream) = &audio_stream {
+            queues[audio_stream.index as usize] = Some(audio_stream);
+        }
+
+        let estimated_duration = input.duration();
+
+        let (mut decode_streams, command_sender) = decode_worker.begin_decode(&queues, Some((44100, 1)), input, input_worker);
+
+        let audio_device = if let Some(audio_stream) = &audio_stream {
+            Some({
+                let (sender, queue) = decode_streams[audio_stream.index as usize].take().unwrap();
+                let ring_buffer = queue.unwrap_audio();
+                {
+                    let ring = ring_buffer.read().unwrap();
+                    playback_clock = Some(Box::new(ring.clock()));
+                    master_clock = Some(Box::new(ring.clock()));
+                }
+                AudioDevice::default_device(ring_buffer, sender).unwrap()
+            })
+        } else {
+            todo!()
+        };
+        let video_playback = if let Some(video_stream) = &video_stream && let Some(video_surface) = video_surface {
+            let (sender, queue) = decode_streams[video_stream.index as usize].take().unwrap();
+            let playback = VideoPlayback::new(queue.unwrap_video(), sender, video_surface.clone(), playback_clock.unwrap());
+            Some(playback)
+        } else { None };
+
+        VideoPlayer {
+            video_playback,
+            audio_device,
+            video_stream,
+            audio_stream,
+            master_clock: master_clock.unwrap(),
+            input_command_sender: command_sender,
+            estimated_duration,
+        }
+    }
+
+    pub fn render_update(&mut self) {
+        if let Some(playback) = self.video_playback.as_mut() {
+            playback.update();
+        }
+    }
+
+    pub fn play(&mut self) {
+        if let Some(device) = &mut self.audio_device {
+            device.play();
+        }
+        if let Some(playback) = self.video_playback.as_mut() {
+            playback.playing = true;
+        }
+    }
+
+    pub fn pause(&mut self) {
+        if let Some(device) = &mut self.audio_device {
+            device.pause();
+        }
+        if let Some(playback) = self.video_playback.as_mut() {
+            playback.playing = false;
+        }
+    }
+
+    pub fn seek(&mut self, target: f64) {
+        self.input_command_sender.send(InputCommand::Seek(0.0, target, None)).unwrap();
+        self.master_clock.set_seek_flag(target);
+        if let Some(playback) = &mut self.video_playback {
+            playback.seek = Some(target);
+        }
+    }
+
+    pub fn current_pts(&self) -> f64 {
+        if self.is_playing() {
+            self.master_clock.pts_interpolated()
+        } else {
+            self.master_clock.pts()
+        }
+    }
+
+    pub fn is_playing(&self) -> bool {
+        if let Some(device) = &self.audio_device {
+            return device.is_playing()
+        }
+        if let Some(playback) = self.video_playback.as_ref() {
+            return playback.playing
+        }
+        false
+    }
 }

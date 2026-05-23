@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::mem::replace;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
-use glfw::{Action, Context, Glfw, GlfwReceiver, Key, PWindow, WindowEvent, WindowHint};
+use glfw::{Action, Context, Glfw, GlfwReceiver, Key, MouseButton, PWindow, WindowEvent, WindowHint};
 use crate::gs::gl::{check_errors, ErrorType};
 use crate::gs::shader::UniformValue;
 
@@ -10,12 +10,15 @@ pub trait WindowHandler {
     fn initialize(&mut self, window: &mut Window);
     fn render(&mut self, dt: f32, window: &mut Window);
     fn handle_key(&mut self, key: Key, action: Action, window: &Window);
+    fn handle_mouse_button(&mut self, button: MouseButton, action: Action, window: &Window);
+    fn handle_mouse_position(&mut self, x: f32, y: f32, window: &Window);
 }
 
 pub struct Window {
     glfw: Glfw,
     window: PWindow,
     events: GlfwReceiver<(f64, WindowEvent)>,
+    pub mouse_position: (f32, f32),
 }
 
 impl Window {
@@ -30,6 +33,8 @@ impl Window {
 
         window.make_current();
         window.set_key_polling(true);
+        window.set_mouse_button_polling(true);
+        window.set_cursor_pos_polling(true);
         window.set_framebuffer_size_polling(true);
         window.set_size_polling(true);
 
@@ -38,6 +43,7 @@ impl Window {
         let window = Window {
             glfw,
             window,
+            mouse_position: (0.0, 0.0),
             events,
         };
         Some(window)
@@ -70,6 +76,13 @@ impl Window {
                     }
                     glfw::WindowEvent::Size(w, h) => {
                     }
+                    glfw::WindowEvent::MouseButton(button, action, _) => {
+                        handler.handle_mouse_button(button, action, self);
+                    }
+                    glfw::WindowEvent::CursorPos(x, y) => {
+                        self.mouse_position = (x as f32, self.window.get_size().1 as f32 - y as f32);
+                        handler.handle_mouse_position(self.mouse_position.0, self.mouse_position.1, self);
+                    }
                     _ => {}
                 }
             }
@@ -89,6 +102,10 @@ impl Window {
 
     pub fn get_clipboard(&self) -> Option<String> {
         self.window.get_clipboard_string()
+    }
+
+    pub fn is_fullscreen(&self) -> bool {
+        todo!()
     }
 
     pub fn get_size(&self) -> (f32, f32) {

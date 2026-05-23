@@ -2,7 +2,7 @@ use std::ffi::CString;
 use std::str::FromStr;
 use ffmpeg_sys_next::{av_dict_set, AVDictionary};
 
-pub fn convert_options(options: Vec<(&str, &str)>) -> *mut AVDictionary {
+pub fn convert_options(options: &[(&str, &str)]) -> *mut AVDictionary {
     let mut dict: *mut AVDictionary = std::ptr::null_mut();
     for (key, value) in options {
         unsafe {

@@ -1,6 +1,6 @@
 use crate::ffmpeg;
 use crate::ffmpeg::error::Error;
-use ffmpeg_sys_next::{av_dict_set, av_dump_format, av_q2d, av_read_frame, avcodec_parameters_alloc, avcodec_parameters_copy, avcodec_parameters_free, avformat_find_stream_info, avformat_seek_file, AVCodecParameters, AVMediaType, AVRational, AVStream};
+use ffmpeg_sys_next::{av_dict_set, av_dump_format, av_q2d, av_read_frame, avcodec_parameters_alloc, avcodec_parameters_copy, avcodec_parameters_free, avformat_find_stream_info, avformat_seek_file, AVCodecParameters, AVMediaType, AVRational, AVStream, AV_TIME_BASE};
 use ffmpeg_sys_next::avformat_alloc_context;
 use ffmpeg_sys_next::avformat_close_input;
 use ffmpeg_sys_next::avformat_open_input;
@@ -102,7 +102,15 @@ pub struct Input {
 unsafe impl Send for Input {}
 
 impl Input {
-    pub fn open(path: &str, options: Vec<(&str, &str)>) -> Result<Self, Error> {
+    pub fn build_http_headers<'a>(headers: &[(&'a str, &'a str)]) -> String {
+        let mut result = String::new();
+        for (name, value) in headers {
+            result.push_str(format!("{}: {}\r\n", name, value).as_str());
+        }
+        result
+    }
+
+    pub fn open(path: &str, options: &[(&str, &str)]) -> Result<Self, Error> {
         unsafe {
             let mut context = avformat_alloc_context();
             let path_str = CString::from_str(path).unwrap();
@@ -132,6 +140,12 @@ impl Input {
                 id: INPUT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 streams
             })
+        }
+    }
+    
+    pub fn duration(&self) -> f64 {
+        unsafe {
+            (*self.context).duration as f64 / AV_TIME_BASE as f64
         }
     }
 

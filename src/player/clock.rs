@@ -2,6 +2,7 @@ use std::time::Instant;
 
 pub trait Clock {
     fn serial(&self) -> u32;
+    fn pts(&self) -> f64;
     fn pts_interpolated(&self) -> f64;
     fn set_seek_flag(&self, seek: f64);
 }
