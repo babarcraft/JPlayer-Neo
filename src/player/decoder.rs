@@ -1,12 +1,14 @@
 use std::collections::HashMap;
+use std::mem::transmute;
 use std::slice::Iter;
 use std::sync::{mpsc, Arc, Mutex, RwLock};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_S16;
-use ffmpeg_sys_next::register_t;
+use ffmpeg_sys_next::{register_t, AV_TIME_BASE};
+use crate::ffmpeg::current_time;
 use crate::ffmpeg::decode::{AudioConverter, Decoder, DecoderResult};
 use crate::ffmpeg::frame::{AudioFrame, Frame};
 use crate::ffmpeg::input::{Input, Stream, StreamType};
@@ -21,12 +23,12 @@ pub struct AudioRingBuffer {
     read_index: usize,
     size: usize,
 
-    serial: Option<u32>,
-    pts: Option<f64>,
-    samples_read: usize,
-    last_read: Option<Instant>,
-
-    pub seek: Option<f64>,
+    serial: Arc<AtomicU32>,
+    pts: Arc<AtomicU64>,
+    samples_read: Arc<AtomicUsize>,
+    last_read: Arc<AtomicU64>,
+    closed: Arc<AtomicBool>,
+    seek: Arc<AtomicU64>,
 
     pub latency: Option<f64>,
 
@@ -34,8 +36,6 @@ pub struct AudioRingBuffer {
     pub channels: u16,
 
     pub skips: usize,
-
-    pub closed: bool,
 }
 
 impl AudioRingBuffer {
@@ -48,14 +48,16 @@ impl AudioRingBuffer {
             buffer: vec![0i16; size],
             write_index: 0,
             read_index: 0,
-            samples_read: 0,
-            pts: None,
-            seek: None,
-            serial: None,
+
+            samples_read: Arc::new(AtomicUsize::new(0)),
+            pts: Arc::new(AtomicU64::new(0)),
+            serial: Arc::new(AtomicU32::new(0)),
+            last_read: Arc::new(AtomicU64::new(0)),
+            closed: Arc::new(AtomicBool::new(false)),
+            seek: Arc::new(AtomicU64::new(0)),
+
             latency: None,
-            last_read: None,
             skips: 0,
-            closed: false,
         }
     }
 
@@ -73,8 +75,8 @@ impl AudioRingBuffer {
 
     pub fn read_to(&mut self, dest: &mut [i16]) -> usize {
         let to_copy = dest.len().min(self.size);
-        self.samples_read += to_copy;
-        self.last_read = Some(Instant::now());
+        self.samples_read.fetch_add(to_copy, Ordering::SeqCst);
+        self.last_read.store(current_time(), Ordering::SeqCst);
         for i in 0..to_copy {
             dest[i] = self.buffer[self.read_index];
             self.read_index = (self.read_index + 1) % self.buffer.len();
@@ -84,33 +86,28 @@ impl AudioRingBuffer {
     }
 
     pub fn write_from(&mut self, src: &[i16], pts: f64, serial: u32) -> usize {
-        if let Some(current_serial) = self.serial {
-            if current_serial != serial {
-                self.serial = Some(serial);
-                self.pts = Some(pts);
-
-                self.last_read = None;
-                self.samples_read = 0;
-                self.size = 0;
-                self.read_index = 0;
-                self.write_index = 0;
-            }
-        } else {
-            self.serial = Some(serial);
-            self.pts = Some(pts);
+        if self.serial.load(Ordering::SeqCst) != serial {
+            self.serial.store(serial, Ordering::SeqCst);
+            self.pts.store(unsafe { transmute(pts) }, Ordering::SeqCst);
+            self.last_read.store(current_time(), Ordering::SeqCst);
+            self.samples_read.store(0, Ordering::SeqCst);
+            self.size = 0;
+            self.read_index = 0;
+            self.write_index = 0;
         }
 
         let to_copy = src.len().min(self.remaining_space());
 
         let time = to_copy as f64 / (self.sample_rate as f64 * self.channels as f64);
-        if let Some(seek) = self.seek {
+        let seek: f64 = unsafe { transmute(self.seek.load(Ordering::SeqCst)) };
+        if seek >= 0.0 {
             if pts < seek && pts + time < seek {
-                self.pts = Some(pts);
-                self.last_read = None;
+                self.pts.store(unsafe { transmute(pts + time) }, Ordering::SeqCst);
+                self.last_read.store(current_time(), Ordering::SeqCst);
                 self.skips += 1;
                 return to_copy;
             } else {
-                self.seek = None;
+                self.seek.store(unsafe { transmute(-1.0f64) }, Ordering::SeqCst);
                 self.skips = 0;
             }
         }
@@ -124,20 +121,48 @@ impl AudioRingBuffer {
     }
 
     pub fn close(&mut self) {
-        self.closed = true;
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn clock(&self) -> AudioRingClock {
+        AudioRingClock {
+            serial: self.serial.clone(),
+            pts: self.pts.clone(),
+            samples_read: self.samples_read.clone(),
+            last_read: self.last_read.clone(),
+            closed: self.closed.clone(),
+            seek: self.seek.clone(),
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        }
     }
 }
 
-impl Clock for AudioRingBuffer {
-    fn serial(&self) -> Option<u32> {
-        self.serial
+pub struct AudioRingClock {
+    serial: Arc<AtomicU32>,
+    pts: Arc<AtomicU64>,
+    samples_read: Arc<AtomicUsize>,
+    last_read: Arc<AtomicU64>,
+    closed: Arc<AtomicBool>,
+    seek: Arc<AtomicU64>,
+    sample_rate: u32,
+    channels: u16,
+}
+
+impl Clock for AudioRingClock {
+    fn serial(&self) -> u32 {
+        self.serial.load(Ordering::SeqCst)
     }
 
-    fn pts_interpolated(&self) -> Option<f64> {
-        let pts = self.pts?;
-        let read_secs = self.samples_read as f64 / (self.sample_rate as f64 * self.channels as f64);
-        let inter = self.last_read.clone().unwrap_or(Instant::now()).elapsed().as_secs_f64();
-        Some(pts + read_secs + inter + self.latency.unwrap_or(0.0))
+    fn pts_interpolated(&self) -> f64 {
+        let pts: f64 = unsafe { transmute(self.pts.load(Ordering::SeqCst)) };
+        let read_secs = self.samples_read.load(Ordering::SeqCst) as f64 / (self.sample_rate as f64 * self.channels as f64);
+        let inter = (current_time() - self.last_read.load(Ordering::SeqCst)) as f64 / AV_TIME_BASE as f64;
+        pts + read_secs + inter
+    }
+
+    fn set_seek_flag(&self, seek: f64) {
+        self.seek.store(unsafe { transmute(seek) }, Ordering::SeqCst);
     }
 }
 
@@ -168,7 +193,7 @@ impl FrameConsumer {
                 frame_queue.read().unwrap().closed
             },
             FrameConsumer::AudioConsumer(ring) => {
-                ring.read().unwrap().closed
+                ring.read().unwrap().closed.load(Ordering::SeqCst)
             }
         }
     }
@@ -197,8 +222,8 @@ impl DecodePair {
                     let ring = ring.read().unwrap();
                     ring.remaining_space()
                 };
-                if let Some(_) = self.audio_frame.as_ref() {
-                    if remaining_space >= self.audio_frame_remaining {
+                if let Some(frame) = self.audio_frame.as_ref() {
+                    if remaining_space >= self.audio_frame_remaining || frame.serial != serial {
                         true
                     } else {
                         false
@@ -329,12 +354,22 @@ impl DecodeWorker {
                                 DecoderResult::NeedsInput => {
                                     if let Some(packet) = pair.packet_queue.0.write().unwrap().pop() {
                                         pair.decoder.send_packet(&packet).unwrap();
-                                        pair.packet_queue.1.send(InputWorkerMessage::Update).unwrap();
                                         pair.needs_input = false;
                                     } else {
                                         pair.needs_input = true;
+                                        let typ = match &pair.frame_consumer {
+                                            FrameConsumer::AudioConsumer(ring) => "audio miss packet",
+                                            FrameConsumer::VideoConsumer(ring) => "video miss packet",
+                                        };
+                                        let mut map = wake_ups.write().unwrap();
+                                        if let Some(current) = map.get_mut(typ) {
+                                            *current += 1;
+                                        } else {
+                                            map.insert(typ, 1usize);
+                                        }
                                         passes.fetch_add(1, Ordering::Relaxed);
                                     }
+                                    pair.packet_queue.1.send(InputWorkerMessage::Update).unwrap();
                                 }
                             }
                         }

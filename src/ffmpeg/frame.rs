@@ -236,10 +236,12 @@ impl Drop for Frame {
     }
 }
 
+#[derive(Debug)]
 pub enum SampleType {
     Float
 }
 
+#[derive(Debug)]
 pub struct AudioFrame {
     pub planes: [*mut u8; 8],
     pub plane_sizes: [Option<usize>; 8],

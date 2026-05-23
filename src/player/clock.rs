@@ -1,8 +1,9 @@
 use std::time::Instant;
 
 pub trait Clock {
-    fn serial(&self) -> Option<u32>;
-    fn pts_interpolated(&self) -> Option<f64>;
+    fn serial(&self) -> u32;
+    fn pts_interpolated(&self) -> f64;
+    fn set_seek_flag(&self, seek: f64);
 }
 
 pub struct GenClock {

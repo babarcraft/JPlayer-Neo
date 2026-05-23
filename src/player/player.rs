@@ -10,7 +10,7 @@ use crate::player::surface::{FrameQueue, VideoSurface};
 
 pub struct VideoPlayback {
     frame_queue: Arc<RwLock<FrameQueue>>,
-    master_clock: Arc<RwLock<dyn Clock>>,
+    master_clock: Box<dyn Clock>,
     sender: Sender<DecodeWorkerMessage>,
     surface: Rc<RefCell<VideoSurface>>,
     pub last_pts: Option<f64>,
@@ -28,7 +28,7 @@ impl VideoPlayback {
         frame_queue: Arc<RwLock<FrameQueue>>,
         sender: Sender<DecodeWorkerMessage>,
         surface: Rc<RefCell<VideoSurface>>,
-        master_clock: Arc<RwLock<dyn Clock>>
+        master_clock: Box<dyn Clock>
     ) -> Self {
         Self {
             frame_queue,
@@ -53,10 +53,7 @@ impl VideoPlayback {
 
         let current_time = self.begin.elapsed().as_secs_f64();
 
-        let audio_clock = self.master_clock.read()
-            .ok()
-            .and_then(|master_clock| { master_clock.pts_interpolated() })
-            .unwrap_or(0.0);
+        let audio_clock = self.master_clock.pts_interpolated();
 
         let mut video_surface = self.surface.borrow_mut();
 
@@ -82,7 +79,7 @@ impl VideoPlayback {
                 let mut skip = false;
 
                 if let Some(seek) = self.seek {
-                    if current_pts < seek {
+                    if current_pts < seek.min(audio_clock) {
                         self.skips += 1;
                         self.last_pts = Some(current_pts);
                         skip = true;

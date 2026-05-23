@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::mem::replace;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;

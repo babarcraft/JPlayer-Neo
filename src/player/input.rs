@@ -107,6 +107,30 @@ impl InputPair {
             .map(|item| item.unwrap());
         queued.sum::<f64>() / count as f64
     }
+
+    pub fn min_queued(&self) -> Option<f64> {
+        let mut current = None;
+        for (queue, _) in self.queue.iter()
+            .filter(|item| item.is_some())
+            .map(|item| item.as_ref().unwrap()) {
+
+            let queue = queue.read().unwrap();
+            let queued = queue.queued();
+            if queued.is_none() {
+                continue;
+            }
+            let queued = queued.unwrap();
+
+            if let Some(current_queued) = current {
+                if queued > current_queued {
+                    current = Some(queued)
+                }
+            } else {
+                current = Some(queued);
+            }
+        }
+        current
+    }
 }
 
 pub struct InputWorker {
@@ -140,10 +164,12 @@ impl InputWorker {
                             }
                         }));
                         inputs.sort_by(|pair_a, pair_b| {
-                            pair_a.average_queued().total_cmp(&pair_b.average_queued())
+                            let a_min = pair_a.min_queued().unwrap_or(0.0);
+                            let b_min = pair_b.min_queued().unwrap_or(0.0);
+                            a_min.total_cmp(&b_min)
                         });
                         let mut available = inputs.iter_mut()
-                            .filter(|pair| pair.average_queued() < 5.0)
+                            .filter(|pair| pair.min_queued().and_then(|q| Some(q < 5.0)).unwrap_or(true))
                             .peekable();
                         passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let empty = available.peek().is_none();

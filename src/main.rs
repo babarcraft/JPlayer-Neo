@@ -8,7 +8,7 @@ use crate::ffmpeg::input::{Input, Stream, StreamType};
 use crate::gs::nvg::NvgContext;
 use crate::gs::texture::InternalFormat;
 use crate::gs::window::{Window, WindowHandler};
-use crate::player::decoder::{DecodeWorker, DecodeWorkerMessage};
+use crate::player::decoder::{AudioRingClock, DecodeWorker, DecodeWorkerMessage};
 use crate::player::input::{InputCommand, InputWorker};
 use crate::player::surface::{FrameQueue, VideoSurface};
 use glfw::{Action, Context, Key};
@@ -33,6 +33,7 @@ struct App {
     video_playback: Option<VideoPlayback>,
     audio_device: Option<AudioDevice>,
     command_sender: Option<Sender<InputCommand>>,
+    audio_ring_clock: Option<AudioRingClock>,
     nvg_image: Option<i32>,
     nvg_context: NvgContext,
     begin: Instant,
@@ -63,6 +64,7 @@ impl App {
             audio_device: None,
             nvg_image: None,
             command_sender: None,
+            audio_ring_clock: None,
             input_worker: InputWorker::new(),
             decode_worker: DecodeWorker::new(),
             nvg_context,
@@ -85,11 +87,6 @@ impl WindowHandler for App {
         let mut video_surface = self.video_surface.borrow_mut();
         if let Some((width, height)) = video_surface.size_update.take() {
             self.nvg_image = Some(self.nvg_context.create_texture_image(&video_surface.output_texture));
-        }
-
-        if let Some(serial) = self.audio_device.as_ref()
-            .and_then(|device| device.ring_buffer.read().ok()
-                .and_then(|ring| ring.serial())) {
         }
 
         let (w, h) = window.get_size();
@@ -137,11 +134,12 @@ impl WindowHandler for App {
                     self.video_playback.take();
                     self.audio_device.take();
                     self.command_sender.take();
+                    self.audio_ring_clock.take();
                 }
             }
             Key::Enter => {
                 if action == Action::Press {
-                    let input = Input::open("test.mp4", vec![]).unwrap();
+                    let input = Input::open("test_h.webm", vec![]).unwrap();
 
                     let audio_stream = input
                         .streams
@@ -167,8 +165,10 @@ impl WindowHandler for App {
                     };
 
                     let (sender, queue) = decode_streams[video_stream.index as usize].take().unwrap();
-                    let playback = VideoPlayback::new(queue.unwrap_video(), sender, self.video_surface.clone(), device.ring_buffer.clone());
+                    let clock = device.ring_buffer.read().unwrap().clock();
+                    let playback = VideoPlayback::new(queue.unwrap_video(), sender, self.video_surface.clone(), Box::new(clock));
                     self.video_playback = Some(playback);
+                    self.audio_ring_clock = Some(device.ring_buffer.read().unwrap().clock());
                     self.audio_device = Some(device);
                     self.command_sender = Some(command_sender);
                 }
@@ -176,10 +176,13 @@ impl WindowHandler for App {
             Key::Right => {
                 if action == Action::Press {
                     if let Some(sender) = &self.command_sender {
-                        if let Some(device) = &self.audio_device {
-                            let mut ring = device.ring_buffer.write().unwrap();
-                            let target = ring.pts_interpolated().unwrap_or(0.0) + 5.0;
+                        if let Some(clock) = &self.audio_ring_clock {
+                            let target = clock.pts_interpolated() + 5.0;
                             sender.send(InputCommand::Seek(0.0, target, None)).unwrap();
+                            clock.set_seek_flag(target);
+                            if let Some(playback) = &mut self.video_playback {
+                                playback.seek = Some(target);
+                            }
                         }
                     }
                 }
@@ -187,10 +190,13 @@ impl WindowHandler for App {
             Key::Left => {
                 if action == Action::Press {
                     if let Some(sender) = &self.command_sender {
-                        if let Some(device) = &self.audio_device {
-                            let mut ring = device.ring_buffer.write().unwrap();
-                            let target = ring.pts_interpolated().unwrap_or(0.0) - 5.0;
+                        if let Some(clock) = &self.audio_ring_clock {
+                            let target = clock.pts_interpolated() - 5.0;
                             sender.send(InputCommand::Seek(0.0, target, None)).unwrap();
+                            clock.set_seek_flag(target);
+                            if let Some(playback) = &mut self.video_playback {
+                                playback.seek = Some(target);
+                            }
                         }
                     }
                 }

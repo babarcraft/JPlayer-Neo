@@ -1,18 +1,19 @@
 use std::ffi::{CStr, CString};
 use std::ptr::{null, null_mut};
 use std::str::FromStr;
-use nanovg_sys::{nvgBeginFrame, nvgBeginPath, nvgCreateFont, nvgCreateGL3, nvgEndFrame, nvgFill, nvgFillPaint, nvgFontFace, nvgFontSize, nvgImagePattern, nvgRect, nvgText, nvglCreateImageFromHandleGL3, NVGpaint};
+use nanovg_sys::{nvgBeginFrame, nvgBeginPath, nvgCreateFont, nvgCreateGL3, nvgEndFrame, nvgFill, nvgFillColor, nvgFillPaint, nvgFontFace, nvgFontSize, nvgImagePattern, nvgRect, nvgText, nvglCreateImageFromHandleGL3, NVGcolor, NVGpaint};
 use crate::gs::texture::Texture;
 
 pub struct NvgContext {
-    context: *mut nanovg_sys::NVGcontext
+    context: *mut nanovg_sys::NVGcontext,
+    size: (f32, f32),
 }
 
 impl NvgContext {
     pub fn new() -> NvgContext {
         unsafe {
             let context = nvgCreateGL3(0);
-            NvgContext { context }
+            NvgContext { context, size: (0.0, 0.0) }
         }
     }
 
@@ -42,6 +43,7 @@ impl NvgContext {
     pub fn frame<F>(&mut self, size: (f32, f32), draw: F) where F: FnOnce(&mut NvgContext) {
         unsafe {
             nvgBeginFrame(self.context, size.0, size.1, 1.0);
+            self.size = size;
             draw(self);
             nvgEndFrame(self.context);
         }
@@ -61,7 +63,16 @@ impl NvgContext {
     
     pub fn image_paint(&mut self, image_id: i32, origin: (f32, f32), size: (f32, f32)) -> NVGpaint {
         unsafe {
-            nvgImagePattern(self.context, origin.0, origin.1, size.0, size.1, 0.0, image_id, 1.0)
+            let oy = self.size.1 - origin.1 - size.1;
+            nvgImagePattern(self.context, origin.0, oy, size.0, size.1, 0.0, image_id, 1.0)
+        }
+    }
+
+    pub fn fill_color(&mut self, color: (f32, f32, f32, f32)) {
+        unsafe {
+            nvgFillColor(self.context, NVGcolor {
+                rgba: [color.0, color.1, color.2, color.3],
+            });
         }
     }
     
@@ -79,7 +90,8 @@ impl NvgContext {
     
     pub fn rect(&mut self, origin: (f32, f32), size: (f32, f32)) {
         unsafe {
-            nvgRect(self.context, origin.0, origin.1, size.0, size.1);
+            let y = self.size.1 - origin.1 - size.1;
+            nvgRect(self.context, origin.0, y, size.0, size.1);
         }
     }
 }
