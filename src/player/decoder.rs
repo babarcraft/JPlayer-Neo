@@ -241,7 +241,6 @@ impl DecodePair {
             FrameConsumer::VideoConsumer(queue) => {
                 let queue = queue.read().unwrap();
                 if queue.serial() != serial {
-                    println!("Damn: {} != {}", serial.unwrap_or(0), queue.serial().unwrap_or(0));
                     return true
                 }
                 queue.has_space()
@@ -345,6 +344,7 @@ impl DecodeWorker {
                                 }
                             })
                             .peekable();
+                        passes.fetch_add(1, Ordering::Relaxed);
                         let empty = available.peek().is_none();
                         for pair in available {
                             if pair.write_remaining() {
@@ -373,9 +373,8 @@ impl DecodeWorker {
                                         } else {
                                             map.insert(typ, 1usize);
                                         }
-                                        passes.fetch_add(1, Ordering::Relaxed);
+                                        pair.packet_queue.1.send(InputWorkerMessage::Update).unwrap();
                                     }
-                                    pair.packet_queue.1.send(InputWorkerMessage::Update).unwrap();
                                 }
                             }
                         }
@@ -414,7 +413,12 @@ impl DecodeWorker {
         self.sender.clone()
     }
 
-    pub fn begin_decode(&mut self, streams: &Vec<Option<&Stream>>, audio_config: Option<(u32, u16)>, input: Input, input_worker: &mut InputWorker) -> (Vec<Option<(Sender<DecodeWorkerMessage>, FrameConsumer)>>, Sender<InputCommand>) {
+    pub fn begin_decode(&mut self,
+                        streams: &Vec<Option<&Stream>>,
+                        audio_config: Option<(u32, u16)>,
+                        input: Input,
+                        input_worker: &mut InputWorker
+    ) -> (Vec<Option<(Sender<DecodeWorkerMessage>, FrameConsumer)>>, Sender<InputCommand>) {
         let queues = streams.iter().map(|stream| {
             if let Some(stream) = stream {
                 Some((*stream, self.sender.clone()))

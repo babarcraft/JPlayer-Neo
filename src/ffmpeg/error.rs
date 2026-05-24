@@ -1,5 +1,5 @@
 use std::ffi::{c_char, CStr};
-use ffmpeg_sys_next::{av_make_error_string, av_strerror};
+use ffmpeg_sys_next::{av_make_error_string, av_strerror, AVERROR, AVERROR_EOF, EOF};
 
 #[derive(Debug)]
 pub struct Error {
@@ -21,5 +21,9 @@ impl Error {
                 code,
             }
         }
+    }
+    
+    pub fn is_eof(&self) -> bool {
+        self.code == AVERROR_EOF
     }
 }

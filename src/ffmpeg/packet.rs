@@ -25,13 +25,13 @@ impl Packet {
         }
     }
 
-    pub(super) fn read_from(&mut self, context: *mut AVFormatContext) -> Option<Error> {
+    pub(super) fn read_from(&mut self, context: *mut AVFormatContext) -> Result<(), Error> {
         unsafe {
             let result = av_read_frame(context, self.pointer);
             if result < 0 {
-                return Some(Error::from_code(result))
+                return Err(Error::from_code(result))
             }
-            None
+            Ok(())
         }
     }
 

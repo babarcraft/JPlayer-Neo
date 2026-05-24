@@ -8,7 +8,7 @@ use crate::gs::texture::InternalFormat;
 use crate::player::audio::AudioDevice;
 use crate::player::clock::Clock;
 use crate::player::decoder::{DecodeWorker, DecodeWorkerMessage};
-use crate::player::input::{InputCommand, InputWorker};
+use crate::player::input::{InputCommand, InputWorker, InputWorkerMessage};
 use crate::player::surface::{FrameQueue, VideoSurface};
 
 pub struct VideoPlayback {
@@ -190,7 +190,9 @@ pub struct VideoPlayer {
     pub master_clock: Box<dyn Clock>,
     pub estimated_duration: f64,
 
-    input_command_sender: Sender<InputCommand>
+    input_command_sender: Sender<InputCommand>,
+    input_worker_sender: Sender<InputWorkerMessage>,
+    decode_worker_sender: Sender<DecodeWorkerMessage>,
 }
 
 impl VideoPlayer {
@@ -246,6 +248,8 @@ impl VideoPlayer {
             audio_stream,
             master_clock: master_clock.unwrap(),
             input_command_sender: command_sender,
+            input_worker_sender: input_worker.get_sender(),
+            decode_worker_sender: decode_worker.get_sender(),
             estimated_duration,
         }
     }
@@ -276,6 +280,8 @@ impl VideoPlayer {
 
     pub fn seek(&mut self, target: f64) {
         self.input_command_sender.send(InputCommand::Seek(0.0, target, None)).unwrap();
+        self.input_worker_sender.send(InputWorkerMessage::Update).unwrap();
+        self.decode_worker_sender.send(DecodeWorkerMessage::Wakeup("Seek")).unwrap();
         self.master_clock.set_seek_flag(target);
         if let Some(playback) = &mut self.video_playback {
             playback.seek = Some(target);

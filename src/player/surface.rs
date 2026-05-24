@@ -54,7 +54,6 @@ impl FrameQueue {
                 self.read_index = self.write_index;
                 self.size = 0;
                 self.serial = Some(frame_serial);
-                println!("Reset")
             }
         } else {
             self.serial = Some(frame_serial);

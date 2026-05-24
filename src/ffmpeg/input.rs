@@ -1,6 +1,6 @@
 use crate::ffmpeg;
 use crate::ffmpeg::error::Error;
-use ffmpeg_sys_next::{av_dict_set, av_dump_format, av_q2d, av_read_frame, avcodec_parameters_alloc, avcodec_parameters_copy, avcodec_parameters_free, avformat_find_stream_info, avformat_seek_file, AVCodecParameters, AVMediaType, AVRational, AVStream, AV_TIME_BASE};
+use ffmpeg_sys_next::{av_dict_set, av_dump_format, av_q2d, av_read_frame, av_seek_frame, avcodec_parameters_alloc, avcodec_parameters_copy, avcodec_parameters_free, avformat_find_stream_info, avformat_flush, avformat_seek_file, avio_seek, AVCodecParameters, AVMediaType, AVRational, AVStream, AVERROR_EOF, AVSEEK_FLAG_BACKWARD, AV_TIME_BASE, SEEK_SET};
 use ffmpeg_sys_next::avformat_alloc_context;
 use ffmpeg_sys_next::avformat_close_input;
 use ffmpeg_sys_next::avformat_open_input;
@@ -13,7 +13,7 @@ use std::ptr::null;
 use std::str::FromStr;
 use std::sync::atomic::AtomicUsize;
 use crate::ffmpeg::packet::Packet;
-use crate::ffmpeg::utils::convert_options;
+use crate::ffmpeg::utils::{convert_options, convert_options_iter};
 
 static INPUT_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -94,9 +94,14 @@ impl Clone for Stream {
 
 pub struct Input {
     context: *mut AVFormatContext,
+    pub options: Vec<(String, String)>,
+    pub path: String,
+
     pub streams: Vec<Stream>,
     pub serial: u32,
-    pub id: usize
+    pub id: usize,
+    pub eof: bool,
+    after_seek: bool
 }
 
 unsafe impl Send for Input {}
@@ -137,9 +142,48 @@ impl Input {
             Ok(Input {
                 context,
                 serial: 0,
+                options: options.iter().map(|&(k, v)| (k.to_string(), v.to_string())).collect(),
+                path: path.to_string(),
                 id: INPUT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                eof: false,
+                after_seek: false,
                 streams
             })
+        }
+    }
+
+    pub fn flush(&mut self) {
+        unsafe {
+            avformat_flush(self.context);
+        }
+    }
+
+    pub fn restart(&mut self) -> Result<(), Error> {
+        unsafe {
+            avformat_close_input(&mut self.context);
+            self.context = avformat_alloc_context();
+            let path_str = CString::from_str(self.path.as_str()).unwrap();
+            let result = avformat_open_input(
+                &mut self.context as *mut *mut AVFormatContext,
+                path_str.as_ptr(),
+                std::ptr::null(),
+                &mut convert_options_iter(&mut self.options.iter().map(|(key, value)| (key.as_str(), value.as_str()))),
+            );
+            if result < 0 {
+                return Err(Error::from_code(result));
+            }
+
+            let result = avformat_find_stream_info(self.context, std::ptr::null_mut());
+            if result < 0 {
+                return Err(Error::from_code(result));
+            }
+
+            av_dump_format(self.context, 0, null(), 0);
+
+            self.streams = std::slice::from_raw_parts((*self.context).streams, (*self.context).nb_streams as usize)
+                .iter().map(|stream| Stream::from_stream(*stream)).collect();
+            self.eof = false;
+            Ok(())
         }
     }
     
@@ -151,29 +195,55 @@ impl Input {
 
     pub fn read_packet(&mut self) -> Result<Packet, Error> {
         let mut packet = Packet::new(self.serial, self.id);
-        if let Some(error) = packet.read_from(self.context) {
+        if self.after_seek {
+            println!("Read after seek");
+        }
+        if let Err(error) = packet.read_from(self.context) {
+            if error.is_eof() {
+                println!("ERROR EOF")
+            }
+            if error.is_eof() && self.after_seek {
+                self.after_seek = false;
+                println!("First EOF, no problem mate");
+                return Err(error);
+            }
+            println!("Second EOF... Yes problem");
+            self.after_seek = false;
+            self.eof = error.is_eof();
             return Err(error);
+        }
+        if self.after_seek {
+            println!("Clear read after seek");
         }
         Ok(packet)
     }
 
     pub fn seek(&mut self, min: f64, max: f64, stream_index: Option<i32>) -> Result<(), Error> {
-        let (min_ts, max_ts, stream_index) = stream_index.and_then(|index| {
+        let (min_ts, max_ts, index) = stream_index.and_then(|index| {
             let base = self.streams[index as usize].timebase;
             Some(((min / base) as i64, (max / base) as i64, index))
-        }).unwrap_or(((min * ffmpeg_sys_next::AV_TIME_BASE as f64) as i64, (max * ffmpeg_sys_next::AV_TIME_BASE as f64) as i64, -1));
+        }).unwrap_or(((min * AV_TIME_BASE as f64) as i64, (max * ffmpeg_sys_next::AV_TIME_BASE as f64) as i64, -1));
         unsafe {
             let result = avformat_seek_file(
                 self.context,
-                stream_index,
+                index,
                 min_ts,
                 max_ts,
                 max_ts,
-                ffmpeg_sys_next::AVSEEK_FLAG_BACKWARD
+                AVSEEK_FLAG_BACKWARD
             );
             if result < 0 {
+                if self.eof {
+                    if let Err(error) = self.restart() {
+                        return Err(error);
+                    }
+                    return self.seek(min, max, stream_index)
+                }
                 return Err(Error::from_code(result));
             }
+            self.eof = false;
+            self.after_seek = true;
+            self.flush();
             self.serial += 1;
             Ok(())
         }

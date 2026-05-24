@@ -79,7 +79,7 @@ impl WindowHandler for App {
     fn render(&mut self, dt: f32, window: &mut Window) {
         clear_current_buffer_color();
 
-        if let Some(playback) = self.video_player.as_mut() {
+        if let Some(playback) = &mut self.video_player {
             playback.render_update();
         }
         let mut video_surface = self.video_surface.borrow_mut();
@@ -104,6 +104,9 @@ impl WindowHandler for App {
                 context.begin_path();
                 context.rect((ox, oy), (pw, ph));
                 context.fill();
+
+                context.text((100.0, 100.0), format!("Decoder Passes: {}", self.decode_worker.passes.load(Ordering::Relaxed)).as_str());
+                context.text((100.0, 120.0), format!("Input Passes: {}", self.input_worker.passes.load(Ordering::Relaxed)).as_str());
 
                 context.begin_path();
                 let h = 0.07;
@@ -133,7 +136,7 @@ impl WindowHandler for App {
             }
             Key::Enter => {
                 if action == Action::Press {
-                    let url = window.get_clipboard().unwrap_or("".to_string());
+                    let url = "test.mp4".to_string();
                     let input = Input::open(url.as_str(), &[
                     ]);
                     match input {

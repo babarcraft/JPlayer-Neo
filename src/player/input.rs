@@ -6,7 +6,8 @@ use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
-use ffmpeg_sys_next::AV_NOPTS_VALUE;
+use ffmpeg_sys_next::{AVERROR_EOF, AV_NOPTS_VALUE};
+use crate::ffmpeg::error::Error;
 use crate::ffmpeg::input::{Input, Stream};
 use crate::ffmpeg::packet::Packet;
 use crate::gs::texture::Texture;
@@ -108,6 +109,26 @@ impl InputPair {
         queued.sum::<f64>() / count as f64
     }
 
+    pub fn serial_matches(&self, serial: u32) -> bool {
+        for (queue, _) in self.queue.iter()
+            .filter(|item| item.is_some())
+            .map(|item| item.as_ref().unwrap()) {
+
+            let queue = queue.read().unwrap();
+            match queue.serial {
+                Some(current) => if current == serial {
+                    continue;
+                }
+                None => {
+                    return true;
+                }
+            }
+
+            return false
+        }
+        true
+    }
+
     pub fn min_queued(&self) -> Option<f64> {
         let mut current = None;
         for (queue, _) in self.queue.iter()
@@ -168,33 +189,53 @@ impl InputWorker {
                             let b_min = pair_b.min_queued().unwrap_or(0.0);
                             a_min.total_cmp(&b_min)
                         });
-                        let mut available = inputs.iter_mut()
-                            .filter(|pair| pair.min_queued().and_then(|q| Some(q < 5.0)).unwrap_or(true))
-                            .peekable();
-                        passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let empty = available.peek().is_none();
                         for pair in inputs.iter_mut() {
                             let input = &mut pair.input;
                             while let Some(command) = pair.receiver.try_recv().ok() {
                                 match command {
                                     InputCommand::Seek(min, max, stream) => {
-                                        input.seek(min, max, stream).unwrap();
-                                        println!("Seek")
+                                        match input.seek(min, max, stream) {
+                                            Err(error) => {
+                                                println!("Error seeking: {:?}", error);
+                                            }
+                                            _ => eprintln!("Currently not implemented!"),
+                                        }
                                     }
                                 }
                             }
+                        }
 
-                            if let Some(packet) = input.read_packet().ok() {
-                                if let Some((queue, sender)) = &pair.queue[packet.stream_index() as usize] {
-                                    let mut queue = queue.write().unwrap();
-                                    let last = queue.queued().unwrap_or(0.0);
-                                    queue.push(packet);
-                                    sender.send(DecodeWorkerMessage::Wakeup("New input")).unwrap();
+                        let mut available = inputs.iter_mut()
+                            .filter(|pair| !pair.input.eof)
+                            .filter(|pair|
+                                pair.min_queued()
+                                    .and_then(|q| Some(q < 5.0))
+                                    .unwrap_or(true) ||
+                                !pair.serial_matches(pair.input.serial)
+                            ).peekable();
+                        passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let empty = available.peek().is_none();
+                        for pair in available {
+                            match pair.input.read_packet() {
+                                Ok(packet) => {
+                                    if let Some((queue, sender)) = &pair.queue[packet.stream_index() as usize] {
+                                        let mut queue = queue.write().unwrap();
+                                        let last = queue.queued().unwrap_or(0.0);
+                                        queue.push(packet);
+                                        sender.send(DecodeWorkerMessage::Wakeup("New input")).unwrap();
+                                    }
+                                },
+                                Err(error) => {
+                                    eprintln!("Read error: {:?}", error);
                                 }
+                            }
+                            if pair.input.eof {
+                                println!("Eof but what the hell?")
                             }
                         }
                         if empty {
                             break
+                        } else {
                         }
                     }
                     receiver.recv().unwrap();
@@ -210,7 +251,14 @@ impl InputWorker {
         }
     }
 
-    pub fn add_input(&mut self, input: Input, mut queues: Vec<Option<(&Stream, Sender<DecodeWorkerMessage>)>>) -> (Vec<Option<Arc<RwLock<PacketQueue>>>>, Sender<InputWorkerMessage>, Sender<InputCommand>) {
+    pub fn get_sender(&self) -> Sender<InputWorkerMessage> {
+        self.sender.clone()
+    }
+
+    pub fn add_input(&mut self,
+                     input: Input,
+                     mut queues: Vec<Option<(&Stream, Sender<DecodeWorkerMessage>)>>
+    ) -> (Vec<Option<Arc<RwLock<PacketQueue>>>>, Sender<InputWorkerMessage>, Sender<InputCommand>) {
         let mut inputs = self.inputs.lock().unwrap();
         for _ in 0..(queues.len() - input.streams.len()) {
             queues.push(None);
