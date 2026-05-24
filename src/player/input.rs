@@ -1,9 +1,10 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::mem::transmute;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex, RwLock};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 use ffmpeg_sys_next::{register_t, AVERROR_EOF, AV_NOPTS_VALUE};
@@ -18,42 +19,106 @@ use crate::player::decoder::DecodeWorkerMessage;
 pub struct PacketQueue {
     queue: VecDeque<Packet>,
     timebase: f64,
-    begin_pts: Option<f64>,
-    end_pts: Option<f64>,
-    serial: Option<u32>,
-    closed: bool,
+    view: PacketQueueView,
+}
+
+#[derive(Clone)]
+pub struct PacketQueueView {
+    initialized: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
+    begin_pts: Arc<AtomicU64>,
+    end_pts: Arc<AtomicU64>,
+    serial: Arc<AtomicU32>,
+}
+
+impl PacketQueueView {
+
+    fn new() -> PacketQueueView {
+        PacketQueueView {
+            initialized: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
+            begin_pts: Arc::new(AtomicU64::new(0)),
+            end_pts: Arc::new(AtomicU64::new(0)),
+            serial: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    pub fn closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    pub fn queued(&self) -> Option<f64> {
+        if self.is_initialized() {
+            let begin: f64 = unsafe { transmute(self.begin_pts.load(Ordering::SeqCst)) };
+            let end: f64 = unsafe { transmute(self.end_pts.load(Ordering::SeqCst)) };
+            Some(end - begin)
+        } else {
+            None
+        }
+    }
+
+    pub fn serial(&self) -> Option<u32> {
+        if self.is_initialized() {
+            Some(self.serial.load(Ordering::SeqCst))
+        } else {
+            None
+        }
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.initialized.load(Ordering::Relaxed)
+    }
+
+    fn update(&self, begin: Option<f64>, end: Option<f64>, serial: Option<u32>) {
+        if let Some(begin) = begin {
+            self.begin_pts.store(unsafe { transmute(begin) }, Ordering::SeqCst);
+        }
+        if let Some(end) = end {
+            self.end_pts.store(unsafe { transmute(end) }, Ordering::SeqCst);
+        }
+        if let Some(serial) = serial {
+            self.serial.store(serial, Ordering::SeqCst);
+        }
+    }
+
 }
 
 impl PacketQueue {
     pub fn new(stream: &Stream) -> Self {
         Self {
             queue: VecDeque::new(),
-            begin_pts: None,
-            end_pts: None,
-            serial: None,
             timebase: stream.timebase,
-            closed: false,
+            view: PacketQueueView::new(),
         }
     }
 
     pub fn serial(&self) -> Option<u32> {
-        self.serial
+        self.view.serial()
+    }
+
+    pub fn view(&self) -> PacketQueueView {
+        self.view.clone()
     }
     
     pub fn push(&mut self, packet: Packet) {
-        if let Some(serial) = self.serial {
+        let serial = self.view.serial();
+        let set_serial = if let Some(serial) = serial {
             if serial != packet.serial {
                 self.queue.clear();
-                self.serial = Some(packet.serial);
+                Some(packet.serial)
+            } else {
+                None
             }
         } else {
-            self.serial = Some(packet.serial);
-        }
+            Some(packet.serial)
+        };
         let pts = packet.pts();
         if pts != AV_NOPTS_VALUE {
             let pts = self.timebase * (pts as f64);
-            self.begin_pts.get_or_insert(pts);
-            self.end_pts = Some(self.end_pts.get_or_insert(pts).max(pts));
+            let begin = if self.view.is_initialized() {
+                None
+            } else { Some(pts) };
+            self.view.update(begin, Some(pts), set_serial);
         }
         self.queue.push_back(packet);
     }
@@ -63,7 +128,7 @@ impl PacketQueue {
             let pts = packet.pts();
             if pts != AV_NOPTS_VALUE {
                 let pts = self.timebase * (pts as f64);
-                self.begin_pts = Some(self.begin_pts?.max(pts));
+                self.view.update(Some(pts), None, None);
             }
             Some(packet)
         } else {
@@ -72,11 +137,11 @@ impl PacketQueue {
     }
 
     pub fn queued(&self) -> Option<f64> {
-        Some(self.end_pts? - self.begin_pts?)
+        self.view.queued()
     }
 
     pub fn close(&mut self) {
-        self.closed = true;
+        self.view.closed.store(true, Ordering::SeqCst);
     }
 }
 
@@ -91,39 +156,30 @@ pub enum InputCommand {
     PutQueue(usize, Arc<RwLock<PacketQueue>>, Sender<DecodeWorkerMessage>),
 }
 
-pub struct InputJob {
+struct InputJobEntry {
+    queue: Arc<RwLock<PacketQueue>>,
+    queue_view: PacketQueueView,
+    consumer_notifier: Sender<DecodeWorkerMessage>,
+}
+
+struct InputJob {
     input: Input,
-    queue: Vec<Option<(Arc<RwLock<PacketQueue>>, Sender<DecodeWorkerMessage>)>>,
+    entries: Vec<Option<InputJobEntry>>,
     receiver: Receiver<InputCommand>,
 }
 
 impl InputJob {
-    pub fn average_queued(&self) -> f64 {
-        let mut count = 0;
-        for _ in self.queue.iter().filter(|this| this.is_some()) {
-            count += 1;
-        }
-        let queued = self.queue.iter()
-            .filter(|item| item.is_some())
-            .map(|queue| queue.as_ref().unwrap().0.read().unwrap().queued())
-            .filter(|item| item.is_some())
-            .map(|item| item.unwrap());
-        queued.sum::<f64>() / count as f64
-    }
-
     pub fn serial_matches(&self, serial: u32) -> bool {
-        for (queue, _) in self.queue.iter()
+        for entry in self.entries.iter()
             .filter(|item| item.is_some())
             .map(|item| item.as_ref().unwrap()) {
 
-            let queue = queue.read().unwrap();
-            match queue.serial {
-                Some(current) => if current == serial {
-                    continue;
+            if let Some(current) = entry.queue_view.serial() {
+                if current == serial {
+                    continue
                 }
-                None => {
-                    return true;
-                }
+            } else {
+                return true
             }
 
             return false
@@ -133,19 +189,16 @@ impl InputJob {
 
     pub fn min_queued(&self) -> Option<f64> {
         let mut current = None;
-        for (queue, _) in self.queue.iter()
+        for entry in self.entries.iter()
             .filter(|item| item.is_some())
             .map(|item| item.as_ref().unwrap()) {
 
-            let queue = queue.read().unwrap();
-            let queued = queue.queued();
-            if queued.is_none() {
-                continue;
-            }
+            let queued = entry.queue_view.queued();
+            if queued.is_none() { continue; }
             let queued = queued.unwrap();
 
             if let Some(current_queued) = current {
-                if queued > current_queued {
+                if queued < current_queued {
                     current = Some(queued)
                 }
             } else {
@@ -230,11 +283,11 @@ impl InputWorkerContext {
         for pair in available {
             match pair.input.read_packet() {
                 Ok(packet) => {
-                    if let Some((queue, sender)) = &pair.queue[packet.stream_index() as usize] {
-                        let mut queue = queue.write().unwrap();
-                        let last = queue.queued().unwrap_or(0.0);
+                    if let Some(entry) = &pair.entries[packet.stream_index() as usize] {
+                        let mut queue = entry.queue.write().unwrap();
+                        // let last = queue.queued().unwrap_or(0.0);
                         queue.push(packet);
-                        sender.send(DecodeWorkerMessage::Wakeup).unwrap();
+                        entry.consumer_notifier.send(DecodeWorkerMessage::Wakeup).unwrap();
                     }
                 },
                 Err(error) => {
@@ -249,13 +302,9 @@ impl InputWorkerContext {
     }
 
     fn clear_inputs(&mut self) {
-        self.inputs.retain(|pair| pair.queue.iter().all(|queue| {
-            if let Some((queue, sender)) = queue {
-                let closed = queue.read().unwrap().closed;
-                if closed {
-                    println!("Packet queue closed!")
-                }
-                !closed
+        self.inputs.retain(|pair| pair.entries.iter().all(|queue| {
+            if let Some(entry) = queue {
+                !entry.queue_view.closed()
             } else {
                 true
             }
@@ -281,7 +330,12 @@ impl InputWorkerContext {
                         }
                     },
                     InputCommand::PutQueue(index, queue, sender) => {
-                        job.queue[index] = Some((queue, sender));
+                        let queue_view = queue.read().unwrap().view();
+                        job.entries[index] = Some(InputJobEntry {
+                            queue,
+                            queue_view,
+                            consumer_notifier: sender,
+                        });
                     }
                 }
             }
@@ -344,7 +398,7 @@ impl InputWorker {
         let queue = (0..input.streams.len()).map(|_| None).collect();
         let job = InputJob {
             input,
-            queue,
+            entries: queue,
             receiver
         };
         let worker_sender = self.sender.clone();

@@ -14,7 +14,7 @@ use crate::ffmpeg::frame::{AudioFrame, Frame};
 use crate::ffmpeg::input::{Input, Stream, StreamType};
 use crate::player::clock::{Clock, GenClock};
 use crate::player::decoder::FrameConsumer::{AudioConsumer, VideoConsumer};
-use crate::player::input::{InputCommand, InputJobHandle, InputWorker, InputWorkerMessage, PacketQueue};
+use crate::player::input::{InputCommand, InputJobHandle, InputWorker, InputWorkerMessage, PacketQueue, PacketQueueView};
 use crate::player::surface::FrameQueue;
 
 pub struct AudioRingBuffer {
@@ -214,6 +214,7 @@ pub enum DecodeWorkerMessage {
 pub struct DecodeJob {
     decoder: Decoder,
     packet_queue: Arc<RwLock<PacketQueue>>,
+    packet_queue_view: PacketQueueView,
     input_handle: InputJobHandle,
     frame_consumer: FrameConsumer,
     frame: Frame,
@@ -327,9 +328,9 @@ impl DecodeWorkerContext {
     fn do_pass(&mut self) -> bool {
         let mut available = self.jobs.iter_mut()
             .filter(|job| {
-                let packet_queue = job.packet_queue.read().unwrap();
-                let frame_queue_space = job.consumer_has_space_and_serial(packet_queue.serial());
-                let packet_queue_space = packet_queue.queued().unwrap_or(0.0);
+                let view = &job.packet_queue_view;
+                let frame_queue_space = job.consumer_has_space_and_serial(view.serial());
+                let packet_queue_space = view.queued().unwrap_or(0.0);
                 if job.needs_input {
                     frame_queue_space && packet_queue_space > 0.0
                 } else {
@@ -456,10 +457,12 @@ impl DecodeWorker {
                 let (sample_rate, channels) = audio_config.expect("Missing audio config");
                 let frame_queue = AudioConsumer(Arc::new(RwLock::new(AudioRingBuffer::new(0.5, sample_rate, channels))));
                 let converter = AudioConverter::new(channels as u32, sample_rate, AV_SAMPLE_FMT_S16);
+                let packet_queue_view = queue.read().unwrap().view();
                 DecodeJob {
                     decoder: Decoder::new(stream, &[]).unwrap(),
                     packet_queue: queue,
                     input_handle: input_job_handle.clone(),
+                    packet_queue_view,
                     frame: Frame::new(),
                     frame_consumer: frame_queue,
                     audio_converter: Some(converter),
@@ -470,10 +473,12 @@ impl DecodeWorker {
             },
             StreamType::Video => {
                 let frame_queue = VideoConsumer(Arc::new(RwLock::new(FrameQueue::new(15))));
+                let packet_queue_view = queue.read().unwrap().view();
                 DecodeJob {
                     decoder: Decoder::new(stream, &[]).unwrap(),
                     packet_queue: queue,
                     input_handle: input_job_handle.clone(),
+                    packet_queue_view,
                     frame: Frame::new(),
                     frame_consumer: frame_queue,
                     audio_converter: None,
