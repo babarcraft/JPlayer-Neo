@@ -14,7 +14,7 @@ use crate::ffmpeg::frame::{AudioFrame, Frame};
 use crate::ffmpeg::input::{Input, Stream, StreamType};
 use crate::player::clock::{Clock, GenClock};
 use crate::player::decoder::FrameConsumer::{AudioConsumer, VideoConsumer};
-use crate::player::input::{InputCommand, InputWorker, InputWorkerMessage, PacketQueue};
+use crate::player::input::{InputCommand, InputJobHandle, InputWorker, InputWorkerMessage, PacketQueue};
 use crate::player::surface::FrameQueue;
 
 pub struct AudioRingBuffer {
@@ -207,20 +207,23 @@ impl FrameConsumer {
 
 pub enum DecodeWorkerMessage {
     End,
-    Wakeup(&'static str)
+    Wakeup,
+    Job(DecodeJob)
 }
 
-pub struct DecodePair {
+pub struct DecodeJob {
     decoder: Decoder,
-    packet_queue: (Arc<RwLock<PacketQueue>>, Sender<InputWorkerMessage>),
+    packet_queue: Arc<RwLock<PacketQueue>>,
+    input_handle: InputJobHandle,
     frame_consumer: FrameConsumer,
+    frame: Frame,
     audio_frame: Option<AudioFrame>,
     audio_frame_remaining: usize,
     audio_converter: Option<AudioConverter>,
     needs_input: bool
 }
 
-impl DecodePair {
+impl DecodeJob {
     pub fn consumer_has_space_and_serial(&self, serial: Option<u32>) -> bool {
         match &self.frame_consumer {
             FrameConsumer::AudioConsumer(ring) => {
@@ -248,12 +251,12 @@ impl DecodePair {
         }
     }
 
-    pub fn write_received(&mut self, frame: &Frame) {
+    pub fn write_received(&mut self) {
         match &mut self.frame_consumer {
             FrameConsumer::AudioConsumer(ring) => {
                 let audio_frame = self.audio_frame.get_or_insert_with(|| AudioFrame::new());
                 let context = self.audio_converter.as_mut().unwrap();
-                context.convert_frame(frame, audio_frame).unwrap();
+                context.convert_frame(&self.frame, audio_frame).unwrap();
                 self.audio_frame_remaining = audio_frame.num_samples;
 
                 let mut ring = ring.write().unwrap();
@@ -261,15 +264,15 @@ impl DecodePair {
                 let begin_index = plane.len() - self.audio_frame_remaining;
                 let end_index = begin_index + self.audio_frame_remaining;
                 self.audio_frame_remaining -=
-                    ring.write_from(&plane[begin_index..end_index], frame.pts.unwrap(), frame.serial.unwrap())
+                    ring.write_from(&plane[begin_index..end_index], self.frame.pts.unwrap(), self.frame.serial.unwrap())
             }
             FrameConsumer::VideoConsumer(queue) => {
                 let mut queue = queue.write().unwrap();
-                if let Some(dest) = queue.peek_write(frame.serial.unwrap()) {
+                if let Some(dest) = queue.peek_write(self.frame.serial.unwrap()) {
                     if self.decoder.is_hardware {
-                        frame.transfer_hw_data_to(dest).unwrap();
+                        self.frame.transfer_hw_data_to(dest).unwrap();
                     } else {
-                        frame.move_to(dest)
+                        self.frame.move_to(dest)
                     }
                     queue.push();
                 } else {
@@ -300,11 +303,122 @@ impl DecodePair {
     }
 }
 
+struct DecodeWorkerContext {
+    jobs: Vec<DecodeJob>,
+    receiver: Receiver<DecodeWorkerMessage>,
+    close: bool,
+    passes: Arc<AtomicUsize>,
+}
+
+impl DecodeWorkerContext {
+
+    fn run(&mut self) {
+        loop {
+            loop {
+                self.clear_jobs();
+                if self.do_pass() && !self.handle_queued_messages() {
+                    break
+                }
+            }
+            self.await_wakeup();
+        }
+    }
+
+    fn do_pass(&mut self) -> bool {
+        let mut available = self.jobs.iter_mut()
+            .filter(|job| {
+                let packet_queue = job.packet_queue.read().unwrap();
+                let frame_queue_space = job.consumer_has_space_and_serial(packet_queue.serial());
+                let packet_queue_space = packet_queue.queued().unwrap_or(0.0);
+                if job.needs_input {
+                    frame_queue_space && packet_queue_space > 0.0
+                } else {
+                    frame_queue_space
+                }
+            })
+            .peekable();
+        self.passes.fetch_add(1, Ordering::Relaxed);
+        let empty = available.peek().is_none();
+        for job in available {
+            if job.write_remaining() {
+                continue;
+            }
+            match job.decoder.receive_frame(&mut job.frame) {
+                DecoderResult::Error(error) => {
+                    println!("Error decoding frame: {:?}", error);
+                },
+                DecoderResult::FrameReceived => {
+                    job.write_received();
+                }
+                DecoderResult::NeedsInput => {
+                    if let Some(packet) = job.packet_queue.write().unwrap().pop() {
+                        job.decoder.send_packet(&packet).unwrap();
+                        job.needs_input = false;
+                    } else {
+                        job.needs_input = true;
+                        let typ = match &job.frame_consumer {
+                            FrameConsumer::AudioConsumer(ring) => "audio miss packet",
+                            FrameConsumer::VideoConsumer(ring) => "video miss packet",
+                        };
+                        job.input_handle.notify_worker();
+                    }
+                }
+            }
+        }
+        empty
+    }
+
+    fn await_wakeup(&mut self) -> bool {
+        if let Some(msg) = self.receiver.recv().ok() {
+            return self.handle_message(msg)
+        }
+        false
+    }
+
+    fn handle_queued_messages(&mut self) -> bool {
+        let mut current = false;
+        while let Some(msg) = self.receiver.try_recv().ok() {
+            if self.handle_message(msg) {
+                current = true;
+            }
+        }
+        current
+    }
+
+    /// handles message and returns whether a pass should be done
+    fn handle_message(&mut self, message: DecodeWorkerMessage) -> bool {
+        match message {
+            DecodeWorkerMessage::Wakeup => {
+                true
+            }
+            DecodeWorkerMessage::Job(job) => {
+                self.jobs.push(job);
+                true
+            }
+            DecodeWorkerMessage::End => {
+                self.close = true;
+                false
+            }
+        }
+    }
+
+    fn clear_jobs(&mut self) {
+        self.jobs.retain(|job| {
+            let closed = job.frame_consumer.is_closed();
+            if closed {
+                job.packet_queue.write().unwrap().close();
+                job.input_handle.notify_worker();
+                println!("Decoder closed!")
+            }
+            !closed
+        });
+    }
+
+}
+
 pub struct DecodeWorker {
-    decoders: Arc<Mutex<Vec<DecodePair>>>,
     sender: Sender<DecodeWorkerMessage>,
     pub passes: Arc<AtomicUsize>,
-    pub wake_ups: Arc<RwLock<HashMap<&'static str, usize>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -312,98 +426,19 @@ impl DecodeWorker {
     pub fn new() -> DecodeWorker {
         let (sender, receiver) = mpsc::channel();
         let passes = Arc::new(AtomicUsize::new(0));
-        let decoders: Arc<Mutex<Vec<DecodePair>>> = Arc::new(Mutex::new(Vec::new()));
-        let wake_ups = Arc::new(RwLock::new(HashMap::new()));
-        let thread = {
-            let decoders = decoders.clone();
-            let passes = passes.clone();
-            let wake_ups = wake_ups.clone();
-            Some(std::thread::spawn(move || {
-                let mut frame = Frame::new();
-                loop {
-                    loop {
-                        let mut decoders = decoders.lock().unwrap();
-                        decoders.retain(|pair| {
-                            let closed = pair.frame_consumer.is_closed();
-                            if closed {
-                                pair.packet_queue.0.write().unwrap().close();
-                                pair.packet_queue.1.send(InputWorkerMessage::Update).unwrap();
-                                println!("Decoder closed!")
-                            }
-                            !closed
-                        });
-                        let mut available = decoders.iter_mut()
-                            .filter(|pair| {
-                                let packet_queue = pair.packet_queue.0.read().unwrap();
-                                let frame_queue_space = pair.consumer_has_space_and_serial(packet_queue.serial());
-                                let packet_queue_space = packet_queue.queued().unwrap_or(0.0);
-                                if pair.needs_input {
-                                    frame_queue_space && packet_queue_space > 0.0
-                                } else {
-                                    frame_queue_space
-                                }
-                            })
-                            .peekable();
-                        passes.fetch_add(1, Ordering::Relaxed);
-                        let empty = available.peek().is_none();
-                        for pair in available {
-                            if pair.write_remaining() {
-                                continue;
-                            }
-                            match pair.decoder.receive_frame(&mut frame) {
-                                DecoderResult::Error(error) => {
-                                    println!("Error decoding frame: {:?}", error);
-                                },
-                                DecoderResult::FrameReceived => {
-                                    pair.write_received(&frame);
-                                }
-                                DecoderResult::NeedsInput => {
-                                    if let Some(packet) = pair.packet_queue.0.write().unwrap().pop() {
-                                        pair.decoder.send_packet(&packet).unwrap();
-                                        pair.needs_input = false;
-                                    } else {
-                                        pair.needs_input = true;
-                                        let typ = match &pair.frame_consumer {
-                                            FrameConsumer::AudioConsumer(ring) => "audio miss packet",
-                                            FrameConsumer::VideoConsumer(ring) => "video miss packet",
-                                        };
-                                        let mut map = wake_ups.write().unwrap();
-                                        if let Some(current) = map.get_mut(typ) {
-                                            *current += 1;
-                                        } else {
-                                            map.insert(typ, 1usize);
-                                        }
-                                        pair.packet_queue.1.send(InputWorkerMessage::Update).unwrap();
-                                    }
-                                }
-                            }
-                        }
-                        if empty {
-                            break
-                        }
-                    }
-                    let message = receiver.recv().unwrap();
-                    match message {
-                        DecodeWorkerMessage::End => {
-                            return
-                        }
-                        DecodeWorkerMessage::Wakeup(name) => {
-                            let mut map = wake_ups.write().unwrap();
-                            if let Some(current) = map.get_mut(name) {
-                                *current += 1;
-                            } else {
-                                map.insert(name, 1usize);
-                            }
-                        }
-                    }
-                }
-            }))
+
+        let mut context = DecodeWorkerContext {
+            jobs: vec![],
+            receiver,
+            close: false,
+            passes: passes.clone()
         };
+        let thread = Some(std::thread::spawn(move || {
+            context.run();
+        }));
 
         DecodeWorker {
-            decoders,
             sender,
-            wake_ups,
             passes,
             thread,
         }
@@ -413,65 +448,46 @@ impl DecodeWorker {
         self.sender.clone()
     }
 
-    pub fn begin_decode(&mut self,
-                        streams: &Vec<Option<&Stream>>,
-                        audio_config: Option<(u32, u16)>,
-                        input: Input,
-                        input_worker: &mut InputWorker
-    ) -> (Vec<Option<(Sender<DecodeWorkerMessage>, FrameConsumer)>>, Sender<InputCommand>) {
-        let queues = streams.iter().map(|stream| {
-            if let Some(stream) = stream {
-                Some((*stream, self.sender.clone()))
-            } else {
-                None
-            }
-        }).collect::<Vec<_>>();
-        let (queues, worker_sender, input_sender) = input_worker.add_input(input, queues);
-        let mut decoders = self.decoders.lock().unwrap();
-        let mut out_queues = (0..streams.len()).map(|_| None).collect::<Vec<_>>();
-        for (queue, stream) in queues.iter().zip(streams) {
-            let stream = match stream {
-                Some(stream) => *stream,
-                None => continue,
-            };
-            let queue = match queue {
-                Some(queue) => queue,
-                None => continue,
-            };
-
-            let pair = match stream.stream_type {
-                StreamType::Audio => {
-                    let (sample_rate, channels) = audio_config.expect("Missing audio config");
-                    let frame_queue = AudioConsumer(Arc::new(RwLock::new(AudioRingBuffer::new(0.5, sample_rate, channels))));
-                    let converter = AudioConverter::new(channels as u32, sample_rate, AV_SAMPLE_FMT_S16);
-                    DecodePair {
-                        decoder: Decoder::new(stream, &[]).unwrap(),
-                        packet_queue: (queue.clone(), worker_sender.clone()),
-                        frame_consumer: frame_queue,
-                        audio_converter: Some(converter),
-                        audio_frame: Some(AudioFrame::new()),
-                        audio_frame_remaining: 0,
-                        needs_input: true
-                    }
-                },
-                StreamType::Video => {
-                    let frame_queue = VideoConsumer(Arc::new(RwLock::new(FrameQueue::new(15))));
-                    DecodePair {
-                        decoder: Decoder::new(stream, &[]).unwrap(),
-                        packet_queue: (queue.clone(), worker_sender.clone()),
-                        frame_consumer: frame_queue,
-                        audio_converter: None,
-                        audio_frame: None,
-                        audio_frame_remaining: 0,
-                        needs_input: true
-                    }
-                },
-                _ => continue,
-            };
-            out_queues[stream.index as usize] = Some((self.sender.clone(), pair.frame_consumer.clone()));
-            decoders.push(pair);
-
-        }
-        (out_queues, input_sender)
+    pub fn add_decode_job(&mut self, stream: &Stream, audio_config: Option<(u32, u16)>, input_job_handle: &InputJobHandle) -> (FrameConsumer, Sender<DecodeWorkerMessage>) {
+        let queue = Arc::new(RwLock::new(PacketQueue::new(stream)));
+        let sender = self.sender.clone();
+        let job = match stream.stream_type {
+            StreamType::Audio => {
+                let (sample_rate, channels) = audio_config.expect("Missing audio config");
+                let frame_queue = AudioConsumer(Arc::new(RwLock::new(AudioRingBuffer::new(0.5, sample_rate, channels))));
+                let converter = AudioConverter::new(channels as u32, sample_rate, AV_SAMPLE_FMT_S16);
+                DecodeJob {
+                    decoder: Decoder::new(stream, &[]).unwrap(),
+                    packet_queue: queue,
+                    input_handle: input_job_handle.clone(),
+                    frame: Frame::new(),
+                    frame_consumer: frame_queue,
+                    audio_converter: Some(converter),
+                    audio_frame: Some(AudioFrame::new()),
+                    audio_frame_remaining: 0,
+                    needs_input: true
+                }
+            },
+            StreamType::Video => {
+                let frame_queue = VideoConsumer(Arc::new(RwLock::new(FrameQueue::new(15))));
+                DecodeJob {
+                    decoder: Decoder::new(stream, &[]).unwrap(),
+                    packet_queue: queue,
+                    input_handle: input_job_handle.clone(),
+                    frame: Frame::new(),
+                    frame_consumer: frame_queue,
+                    audio_converter: None,
+                    audio_frame: None,
+                    audio_frame_remaining: 0,
+                    needs_input: true
+                }
+            },
+            _ => unimplemented!(),
+        };
+        let queue = job.packet_queue.clone();
+        input_job_handle.attach_queue(stream, queue, sender.clone());
+        let consumer = job.frame_consumer.clone();
+        sender.send(DecodeWorkerMessage::Job(job)).unwrap();
+        (consumer, sender)
     }
 }

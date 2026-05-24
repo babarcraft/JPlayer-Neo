@@ -47,7 +47,7 @@ impl AudioDevice {
                 } else {
                     let read = ring_buffer.write().unwrap().read_to(output);
                     output[read..].fill(0);
-                    sender.send(DecodeWorkerMessage::Wakeup("Device output filled")).unwrap();
+                    sender.send(DecodeWorkerMessage::Wakeup).unwrap();
                 }
             }, move |error| {}, None).unwrap()
         };
@@ -83,7 +83,7 @@ impl AudioDevice {
 impl Drop for AudioDevice {
     fn drop(&mut self) {
         self.ring_buffer.write().unwrap().close();
-        self.sender.send(DecodeWorkerMessage::Wakeup("Notify audio device drop")).unwrap();
+        self.sender.send(DecodeWorkerMessage::Wakeup).unwrap();
         self.stream.pause().unwrap();
     }
 }

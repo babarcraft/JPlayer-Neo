@@ -8,7 +8,7 @@ use crate::gs::texture::InternalFormat;
 use crate::player::audio::AudioDevice;
 use crate::player::clock::Clock;
 use crate::player::decoder::{DecodeWorker, DecodeWorkerMessage};
-use crate::player::input::{InputCommand, InputWorker, InputWorkerMessage};
+use crate::player::input::{InputCommand, InputJobHandle, InputWorker, InputWorkerMessage};
 use crate::player::surface::{FrameQueue, VideoSurface};
 
 pub struct VideoPlayback {
@@ -169,7 +169,7 @@ impl VideoPlayback {
         if let Some(mut write_queue) = self.frame_queue.try_write().ok() {
             write_queue.pop();
             if queue_was_full {
-                let _ = self.sender.send(DecodeWorkerMessage::Wakeup("Notify frame queue pop"));
+                let _ = self.sender.send(DecodeWorkerMessage::Wakeup);
             }
         }
     }
@@ -178,7 +178,7 @@ impl VideoPlayback {
 impl Drop for VideoPlayback {
     fn drop(&mut self) {
         self.frame_queue.write().unwrap().close();
-        self.sender.send(DecodeWorkerMessage::Wakeup("Notify queue drop")).unwrap();
+        self.sender.send(DecodeWorkerMessage::Wakeup).unwrap();
     }
 }
 
@@ -190,7 +190,7 @@ pub struct VideoPlayer {
     pub master_clock: Box<dyn Clock>,
     pub estimated_duration: f64,
 
-    input_command_sender: Sender<InputCommand>,
+    input_job_handle: InputJobHandle,
     input_worker_sender: Sender<InputWorkerMessage>,
     decode_worker_sender: Sender<DecodeWorkerMessage>,
 }
@@ -209,21 +209,14 @@ impl VideoPlayer {
             .cloned();
         let mut playback_clock: Option<Box<dyn Clock>> = None;
         let mut master_clock: Option<Box<dyn Clock>> = None;
-        let mut queues: Vec<Option<&Stream>> = (0..input.streams.len()).map(|_| None).collect();
-        if let Some(video_stream) = &video_stream {
-            queues[video_stream.index as usize] = Some(video_stream);
-        }
-        if let Some(audio_stream) = &audio_stream {
-            queues[audio_stream.index as usize] = Some(audio_stream);
-        }
 
         let estimated_duration = input.duration();
 
-        let (mut decode_streams, command_sender) = decode_worker.begin_decode(&queues, Some((44100, 1)), input, input_worker);
+        let handle = input_worker.add_input(input);
 
         let audio_device = if let Some(audio_stream) = &audio_stream {
             Some({
-                let (sender, queue) = decode_streams[audio_stream.index as usize].take().unwrap();
+                let (queue, sender) = decode_worker.add_decode_job(audio_stream, Some((44100, 1)), &handle);
                 let ring_buffer = queue.unwrap_audio();
                 {
                     let ring = ring_buffer.read().unwrap();
@@ -236,7 +229,7 @@ impl VideoPlayer {
             todo!()
         };
         let video_playback = if let Some(video_stream) = &video_stream && let Some(video_surface) = video_surface {
-            let (sender, queue) = decode_streams[video_stream.index as usize].take().unwrap();
+            let (queue, sender) = decode_worker.add_decode_job(video_stream, Some((44100, 1)), &handle);
             let playback = VideoPlayback::new(queue.unwrap_video(), sender, video_surface.clone(), playback_clock.unwrap());
             Some(playback)
         } else { None };
@@ -247,7 +240,7 @@ impl VideoPlayer {
             video_stream,
             audio_stream,
             master_clock: master_clock.unwrap(),
-            input_command_sender: command_sender,
+            input_job_handle: handle,
             input_worker_sender: input_worker.get_sender(),
             decode_worker_sender: decode_worker.get_sender(),
             estimated_duration,
@@ -279,9 +272,9 @@ impl VideoPlayer {
     }
 
     pub fn seek(&mut self, target: f64) {
-        self.input_command_sender.send(InputCommand::Seek(0.0, target, None)).unwrap();
+        self.input_job_handle.seek(0.0, target, None);
         self.input_worker_sender.send(InputWorkerMessage::Update).unwrap();
-        self.decode_worker_sender.send(DecodeWorkerMessage::Wakeup("Seek")).unwrap();
+        self.decode_worker_sender.send(DecodeWorkerMessage::Wakeup).unwrap();
         self.master_clock.set_seek_flag(target);
         if let Some(playback) = &mut self.video_playback {
             playback.seek = Some(target);
