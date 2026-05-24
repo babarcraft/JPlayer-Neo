@@ -51,7 +51,6 @@ impl AudioDevice {
                 }
             }, move |error| {}, None).unwrap()
         };
-        println!("Creation");
 
         stream.pause().unwrap();
 

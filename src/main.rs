@@ -105,25 +105,25 @@ impl WindowHandler for App {
                 context.rect((ox, oy), (pw, ph));
                 context.fill();
 
-                context.text((100.0, 100.0), format!("Decoder Passes: {}", self.decode_worker.passes.load(Ordering::Relaxed)).as_str());
-                context.text((100.0, 120.0), format!("Input Passes: {}", self.input_worker.passes.load(Ordering::Relaxed)).as_str());
-
-                context.begin_path();
-                let h = 0.07;
-                let size = context.relative(0.8, h);
-                let offset = context.relative(0.1, 0.01);
-                self.timeline_bounds = (offset, (offset.0 + size.0, offset.1 + size.1));
-                context.rect(offset, size);
-                context.fill_color((1.0, 1.0, 1.0, 1.0));
-                context.fill();
-                let progress = self.video_player.as_ref()
-                    .map(|player| player.current_pts() / player.estimated_duration)
-                    .unwrap_or(0.0) as f32;
-                context.begin_path();
-                context.rect(offset, context.relative(0.8 * progress, h));
-                context.fill_color((0.3, 0.3, 0.3, 1.0));
-                context.fill();
             }
+            context.text((100.0, 100.0), format!("Decoder Passes: {}", self.decode_worker.passes.load(Ordering::Relaxed)).as_str());
+            context.text((100.0, 120.0), format!("Input Passes: {}", self.input_worker.passes.load(Ordering::Relaxed)).as_str());
+
+            context.begin_path();
+            let h = 0.07;
+            let size = context.relative(0.8, h);
+            let offset = context.relative(0.1, 0.01);
+            self.timeline_bounds = (offset, (offset.0 + size.0, offset.1 + size.1));
+            context.rect(offset, size);
+            context.fill_color((1.0, 1.0, 1.0, 1.0));
+            context.fill();
+            let progress = self.video_player.as_ref()
+                .map(|player| player.current_pts() / player.estimated_duration)
+                .unwrap_or(0.0) as f32;
+            context.begin_path();
+            context.rect(offset, context.relative(0.8 * progress, h));
+            context.fill_color((0.3, 0.3, 0.3, 1.0));
+            context.fill();
         });
     }
 

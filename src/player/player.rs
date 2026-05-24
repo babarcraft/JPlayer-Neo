@@ -64,16 +64,15 @@ impl VideoPlayback {
         let mut queue_was_full = false;
 
         if let Some(queue) = self.frame_queue.try_read().ok() {
-            if let Some(frame_serial) = queue.serial() {
-                if let Some(serial) = self.serial {
-                    if serial != frame_serial {
-                        self.serial = Some(frame_serial);
-                        self.frame_timer.take();
-                        self.last_pts.take();
-                    }
-                } else {
+            let frame_serial = queue.serial();
+            if let Some(serial) = self.serial {
+                if serial != frame_serial {
                     self.serial = Some(frame_serial);
+                    self.frame_timer.take();
+                    self.last_pts.take();
                 }
+            } else {
+                self.serial = Some(frame_serial);
             }
             queue_was_full = !queue.has_space();
 
@@ -217,22 +216,25 @@ impl VideoPlayer {
         let audio_device = if let Some(audio_stream) = &audio_stream {
             Some({
                 let (queue, sender) = decode_worker.add_decode_job(audio_stream, Some((44100, 1)), &handle);
-                let ring_buffer = queue.unwrap_audio();
+                let (ring, view) = queue.unwrap_audio();
                 {
-                    let ring = ring_buffer.read().unwrap();
+                    let ring = ring.read().unwrap();
                     playback_clock = Some(Box::new(ring.clock()));
                     master_clock = Some(Box::new(ring.clock()));
                 }
-                AudioDevice::default_device(ring_buffer, sender).unwrap()
+                AudioDevice::default_device(ring, sender).unwrap()
             })
         } else {
             todo!()
         };
         let video_playback = if let Some(video_stream) = &video_stream && let Some(video_surface) = video_surface {
             let (queue, sender) = decode_worker.add_decode_job(video_stream, Some((44100, 1)), &handle);
-            let playback = VideoPlayback::new(queue.unwrap_video(), sender, video_surface.clone(), playback_clock.unwrap());
+            let (queue, view) = queue.unwrap_video();
+            let playback = VideoPlayback::new(queue, sender, video_surface.clone(), playback_clock.unwrap());
             Some(playback)
         } else { None };
+
+        handle.notify_begin();
 
         VideoPlayer {
             video_playback,

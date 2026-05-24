@@ -196,7 +196,6 @@ impl Input {
     pub fn read_packet(&mut self) -> Result<Packet, Error> {
         let mut packet = Packet::new(self.serial, self.id);
         if self.after_seek {
-            println!("Read after seek");
         }
         if let Err(error) = packet.read_from(self.context) {
             if error.is_eof() {
@@ -213,7 +212,6 @@ impl Input {
             return Err(error);
         }
         if self.after_seek {
-            println!("Clear read after seek");
         }
         Ok(packet)
     }

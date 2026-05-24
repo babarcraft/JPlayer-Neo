@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use crate::ffmpeg::frame::Frame;
 use crate::gs::buffer::PixelBuffer;
 use crate::gs::fence::Fence;
@@ -7,41 +9,73 @@ use crate::gs::texture::{InternalFormat, Texture};
 
 pub struct FrameQueue {
     frames: Vec<Frame>,
-    size: usize,
+    view: FrameQueueView,
     read_index: usize,
     write_index: usize,
-    serial: Option<u32>,
-    pub closed: bool
+}
+
+#[derive(Clone)]
+pub struct FrameQueueView {
+    size: Arc<AtomicUsize>,
+    serial: Arc<AtomicU32>,
+    closed: Arc<AtomicBool>,
+    capacity: usize
+}
+
+impl FrameQueueView {
+    
+    pub fn queued_num(&self) -> usize {
+        self.size.load(Ordering::SeqCst)
+    }
+    
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+    
+    pub fn remaining_space(&self) -> usize {
+        self.capacity() - self.queued_num()
+    }
+    
+    pub fn serial(&self) -> u32 {
+        self.serial.load(Ordering::SeqCst)
+    }
+    
+    pub fn closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
 }
 
 impl FrameQueue {
     pub fn new(capacity: usize) -> Self {
         Self {
             frames: (0..capacity).map(|_| Frame::new()).collect(),
-            size: 0,
+            view: FrameQueueView {
+                size: Arc::new(AtomicUsize::new(0)),
+                serial: Arc::new(AtomicU32::new(0)),
+                closed: Arc::new(AtomicBool::new(false)),
+                capacity
+            },
             read_index: 0,
             write_index: 0,
-            serial: None,
-            closed: false
         }
     }
 
     pub fn has_space(&self) -> bool {
-        self.size < self.frames.len()
+        self.queued_num() < self.frames.len()
     }
 
     pub fn queued_num(&self) -> usize {
-        self.size
+        self.view.queued_num()
     }
 
-    pub fn serial(&self) -> Option<u32> {
-        self.serial
+    pub fn serial(&self) -> u32 {
+        self.view.serial()
     }
 
     pub fn peek_write(&mut self, frame_serial: u32) -> Option<&mut Frame> {
         self.check_and_update_serial(frame_serial);
 
-        if self.size >= self.frames.len() || self.closed {
+        if self.queued_num() >= self.frames.len() || self.view.closed() {
             return None;
         }
 
@@ -49,19 +83,19 @@ impl FrameQueue {
     }
 
     fn check_and_update_serial(&mut self, frame_serial: u32) {
-        if let Some(serial) = self.serial {
-            if frame_serial != serial {
-                self.read_index = self.write_index;
-                self.size = 0;
-                self.serial = Some(frame_serial);
-            }
-        } else {
-            self.serial = Some(frame_serial);
+        if self.serial() != frame_serial {
+            self.read_index = self.write_index;
+            self.view.size.store(0, Ordering::SeqCst);
+            self.view.serial.store(frame_serial, Ordering::SeqCst)
         }
     }
     
+    pub fn view(&self) -> FrameQueueView {
+        self.view.clone()
+    }
+    
     pub fn clear(&mut self) {
-        self.size = 0;
+        self.view.size.store(0, Ordering::SeqCst);
         self.read_index = 0;
         self.write_index = 0;
     }
@@ -76,29 +110,25 @@ impl FrameQueue {
             self.check_and_update_serial(frame_serial);
         }
         self.write_index = (self.write_index + 1) % self.frames.len();
-        self.size += 1;
+        self.view.size.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn peek_read(&self) -> Option<&Frame> {
-        if self.size <= 0 || self.closed {
+        if self.queued_num() <= 0 || self.view.closed() {
             return None;
         }
 
         let frame = &self.frames[self.read_index];
         Some(frame)
     }
-    
-    pub fn queued(&self) -> usize {
-        self.size
-    }
 
     pub fn pop(&mut self) {
         self.read_index = (self.read_index + 1) % self.frames.len();
-        self.size -= 1;
+        self.view.size.fetch_sub(1, Ordering::SeqCst);
     }
 
     pub fn close(&mut self) {
-        self.closed = true;
+        self.view.closed.store(true, Ordering::SeqCst);
     }
 }
 

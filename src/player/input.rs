@@ -66,10 +66,13 @@ impl PacketQueueView {
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.initialized.load(Ordering::Relaxed)
+        self.initialized.load(Ordering::SeqCst)
     }
 
     fn update(&self, begin: Option<f64>, end: Option<f64>, serial: Option<u32>) {
+        if !self.is_initialized() {
+            self.initialized.store(true, Ordering::SeqCst);
+        }
         if let Some(begin) = begin {
             self.begin_pts.store(unsafe { transmute(begin) }, Ordering::SeqCst);
         }
@@ -152,6 +155,7 @@ pub enum InputWorkerMessage {
 }
 
 pub enum InputCommand {
+    Begin,
     Seek(f64, f64, Option<i32>),
     PutQueue(usize, Arc<RwLock<PacketQueue>>, Sender<DecodeWorkerMessage>),
 }
@@ -166,6 +170,7 @@ struct InputJob {
     input: Input,
     entries: Vec<Option<InputJobEntry>>,
     receiver: Receiver<InputCommand>,
+    begin: bool,
 }
 
 impl InputJob {
@@ -271,12 +276,13 @@ impl InputWorkerContext {
 
     fn do_pass(&mut self) -> bool {
         let mut available = self.inputs.iter_mut()
+            .filter(|pair| pair.begin)
             .filter(|pair| !pair.input.eof)
             .filter(|pair|
                 pair.min_queued()
                     .and_then(|q| Some(q < 5.0))
                     .unwrap_or(true) ||
-                    !pair.serial_matches(pair.input.serial)
+                !pair.serial_matches(pair.input.serial)
             ).peekable();
         let empty = available.peek().is_none();
         self.passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -337,6 +343,9 @@ impl InputWorkerContext {
                             consumer_notifier: sender,
                         });
                     }
+                    InputCommand::Begin => {
+                        job.begin = true;
+                    }
                 }
             }
         }
@@ -361,6 +370,11 @@ impl InputJobHandle {
     
     pub fn notify_worker(&self) {
         self.worker_sender.send(InputWorkerMessage::Update).unwrap();
+    }
+
+    pub fn notify_begin(&self) {
+        self.job_sender.send(InputCommand::Begin).unwrap();
+        self.notify_worker();
     }
     
 }
@@ -399,7 +413,8 @@ impl InputWorker {
         let job = InputJob {
             input,
             entries: queue,
-            receiver
+            receiver,
+            begin: false
         };
         let worker_sender = self.sender.clone();
         worker_sender.send(InputWorkerMessage::Job(job)).unwrap();
