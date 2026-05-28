@@ -4,3 +4,4 @@ pub mod decoder;
 pub mod clock;
 pub mod audio;
 pub mod player;
+pub mod ui;

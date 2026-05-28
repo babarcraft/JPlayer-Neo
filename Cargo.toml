@@ -14,3 +14,8 @@ nanovg-sys = {
     features = ["gl3"]
 }
 cpal = "0.17.3"
+reqwest = { version = "0.11", features = ["blocking"] }
+base64 = "0.22.1"
+regex = "1.12.3"
+json = "0.12.4"
+libwebp = { version = "0.1.2", features = ["0_6"] }

@@ -1,13 +1,20 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::fs::File;
+use std::{fs, io};
+use std::io::BufWriter;
 use std::mem::transmute;
 use std::ops::Deref;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 use ffmpeg_sys_next::{register_t, AVERROR_EOF, AV_NOPTS_VALUE};
+use glfw::GamepadButton::ButtonB;
+use reqwest::Response;
+use crate::ffmpeg;
 use crate::ffmpeg::error::Error;
 use crate::ffmpeg::input::{Input, Stream};
 use crate::ffmpeg::packet::Packet;
@@ -148,10 +155,17 @@ impl PacketQueue {
     }
 }
 
+pub type IoOrHttpError = (Option<reqwest::Error>, Option<io::Error>);
+
 pub enum InputWorkerMessage {
     End,
     Update,
-    Job(InputJob)
+    Job(InputReadJob),
+
+    HttpGetText(String, Sender<Result<String, reqwest::Error>>),
+    HttpGetDownload(String, String, Sender<Result<(), IoOrHttpError>>),
+    FileRead(String, Sender<Result<Vec<u8>, io::Error>>),
+    OpenInput(String, Vec<(String, String)>, Sender<Result<Input, Error>>)
 }
 
 pub enum InputCommand {
@@ -160,20 +174,20 @@ pub enum InputCommand {
     PutQueue(usize, Arc<RwLock<PacketQueue>>, Sender<DecodeWorkerMessage>),
 }
 
-struct InputJobEntry {
+struct InputStreamEntry {
     queue: Arc<RwLock<PacketQueue>>,
     queue_view: PacketQueueView,
     consumer_notifier: Sender<DecodeWorkerMessage>,
 }
 
-struct InputJob {
+struct InputReadJob {
     input: Input,
-    entries: Vec<Option<InputJobEntry>>,
+    entries: Vec<Option<InputStreamEntry>>,
     receiver: Receiver<InputCommand>,
     begin: bool,
 }
 
-impl InputJob {
+impl InputReadJob {
     pub fn serial_matches(&self, serial: u32) -> bool {
         for entry in self.entries.iter()
             .filter(|item| item.is_some())
@@ -222,12 +236,55 @@ pub struct InputWorker {
 
 struct InputWorkerContext {
     receiver: Receiver<InputWorkerMessage>,
-    inputs: Vec<InputJob>,
+    inputs: Vec<InputReadJob>,
     passes: Arc<AtomicUsize>,
+    http_client: Option<reqwest::blocking::Client>,
     close: bool,
 }
 
+pub struct TaskHandle<T: Send, E: Send> {
+    value: Option<Result<T, E>>,
+    receiver: Receiver<Result<T, E>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl<T: Send, E: Send + std::fmt::Debug> TaskHandle<T, E> {
+
+    pub fn new() -> (TaskHandle<T, E>, Arc<AtomicBool>, Sender<Result<T, E>>) {
+        let (sender, receiver) = mpsc::channel::<Result<T, E>>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = cancel.clone();
+        (TaskHandle {
+            value: None,
+            receiver,
+            cancel,
+        }, cancel_clone, sender)
+    }
+
+    pub fn poll(&mut self) -> bool {
+        if self.value.is_some() {
+            return true
+        }
+        if let Some(value) = self.receiver.try_recv().ok() {
+            self.value = Some(value);
+            return true
+        }
+        false
+    }
+
+    pub fn take(mut self) -> Result<T, E> {
+        self.value.take().unwrap()
+    }
+}
+
+impl<T: Send, E: Send> Drop for TaskHandle<T, E> {
+    fn drop(&mut self) {
+        self.cancel.store(false, Ordering::Relaxed);
+    }
+}
+
 impl InputWorkerContext {
+
     fn run(&mut self) {
         loop {
             loop {
@@ -258,6 +315,10 @@ impl InputWorkerContext {
         current
     }
 
+    fn get_http_client(&mut self) -> &mut reqwest::blocking::Client {
+        self.http_client.get_or_insert_with(|| reqwest::blocking::Client::new())
+    }
+
     fn handle_message(&mut self, message: InputWorkerMessage) -> bool {
         match message {
             InputWorkerMessage::End => {
@@ -269,6 +330,53 @@ impl InputWorkerContext {
             }
             InputWorkerMessage::Job(job) => {
                 self.inputs.push(job);
+                true
+            }
+            InputWorkerMessage::HttpGetText(path, sender) => {
+                let client = self.get_http_client();
+                let result = client.get(&path).send()
+                    .map(|result| result.text().unwrap());
+                sender.send(result).unwrap();
+                true
+            }
+            InputWorkerMessage::HttpGetDownload(path, filepath, sender) => {
+                let client = self.get_http_client();
+                let result = client.get(&path).send();
+                if result.is_err() {
+                    sender.send(Err((result.err(), None))).unwrap();
+                    return true
+                }
+                let mut result = result.unwrap();
+                let path = Path::new(&path);
+
+                if let Some(parent) = path.parent() {
+                    let result = fs::create_dir_all(parent);
+                    if result.is_err() {
+                        sender.send(Err((None, result.err()))).unwrap();
+                    }
+                }
+
+                let file = File::create(filepath);
+                if file.is_err() {
+                    sender.send(Err((None, file.err()))).unwrap();
+                    return true
+                }
+                let mut file = BufWriter::new(file.unwrap());
+                result.copy_to(&mut file).unwrap();
+                sender.send(Ok(())).unwrap();
+                true
+            }
+            InputWorkerMessage::FileRead(path, sender) => {
+                let result = std::fs::read(path);
+                sender.send(result).unwrap();
+                true
+            }
+            InputWorkerMessage::OpenInput(path, options, sender) => {
+                let options = options.iter()
+                    .map(|(key, val)| (key.as_str(), val.as_str()))
+                    .collect::<Vec<_>>();
+                let input = Input::open(path.as_str(), &options);
+                sender.send(input).unwrap();
                 true
             }
         }
@@ -318,7 +426,7 @@ impl InputWorkerContext {
         self.inputs.sort_by(|pair_a, pair_b| {
             let a_min = pair_a.min_queued().unwrap_or(0.0);
             let b_min = pair_b.min_queued().unwrap_or(0.0);
-            a_min.total_cmp(&b_min)
+            b_min.total_cmp(&a_min)
         });
     }
 
@@ -337,7 +445,7 @@ impl InputWorkerContext {
                     },
                     InputCommand::PutQueue(index, queue, sender) => {
                         let queue_view = queue.read().unwrap().view();
-                        job.entries[index] = Some(InputJobEntry {
+                        job.entries[index] = Some(InputStreamEntry {
                             queue,
                             queue_view,
                             consumer_notifier: sender,
@@ -389,6 +497,7 @@ impl InputWorker {
             receiver,
             inputs: vec![],
             close: false,
+            http_client: None,
             passes: passes.clone(),
         };
         let thread = Some(std::thread::spawn(move || {
@@ -410,7 +519,7 @@ impl InputWorker {
         let (sender, receiver) = mpsc::channel::<InputCommand>();
 
         let queue = (0..input.streams.len()).map(|_| None).collect();
-        let job = InputJob {
+        let job = InputReadJob {
             input,
             entries: queue,
             receiver,
@@ -422,5 +531,29 @@ impl InputWorker {
             job_sender: sender,
             worker_sender
         }
+    }
+
+    pub fn add_http_get_text(&mut self, path: String) -> TaskHandle<String, reqwest::Error> {
+        let (handler, cancel, sender) = TaskHandle::new();
+        self.sender.send(InputWorkerMessage::HttpGetText(path, sender)).unwrap();
+        handler
+    }
+    
+    pub fn add_open_input(&mut self, path: String, options: Vec<(String, String)>) -> TaskHandle<Input, Error> {
+        let (handler, cancel, sender) = TaskHandle::new();
+        self.sender.send(InputWorkerMessage::OpenInput(path, options, sender)).unwrap();
+        handler
+    }
+
+    pub fn add_http_get_download(&mut self, url: String, path: String) -> Receiver<Result<(), IoOrHttpError>> {
+        let (sender, receiver) = mpsc::channel();
+        self.sender.send(InputWorkerMessage::HttpGetDownload(url, path, sender)).unwrap();
+        receiver
+    }
+
+    pub fn add_file_read(&mut self, path: String) -> Receiver<Result<Vec<u8>, io::Error>> {
+        let (sender, receiver) = mpsc::channel();
+        self.sender.send(InputWorkerMessage::FileRead(path, sender)).unwrap();
+        receiver
     }
 }

@@ -85,6 +85,12 @@ bitflags! {
 }
 
 bitflags! {
+	pub struct NVGimageFlagsGL: c_int {
+		const NVG_IMAGE_NODELETE = 1 << 16;
+	}
+}
+
+bitflags! {
 	// #[cfg(any(feature = "gl2", feature = "gl3", feature = "gles2", feature = "gles3"))]
 	pub struct NVGcreateFlags: c_int {
 		const NVG_ANTIALIAS = 1 << 0;

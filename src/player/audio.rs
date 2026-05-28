@@ -39,10 +39,11 @@ impl AudioDevice {
 
         let stream = {
             let ring_buffer = ring_buffer.clone();
+            let view = ring_buffer.read().unwrap().view();
             let sender = sender.clone();
             let playing = playing.clone();
             device.build_output_stream(&config, move |output: &mut [i16], info: &cpal::OutputCallbackInfo| {
-                if ring_buffer.read().unwrap().available() < output.len() || !playing.load(Ordering::Relaxed) {
+                if view.size() < output.len() || !playing.load(Ordering::Relaxed) {
                     output.fill(0);
                 } else {
                     let read = ring_buffer.write().unwrap().read_to(output);

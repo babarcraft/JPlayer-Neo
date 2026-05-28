@@ -9,10 +9,11 @@ use crate::player::audio::AudioDevice;
 use crate::player::clock::Clock;
 use crate::player::decoder::{DecodeWorker, DecodeWorkerMessage};
 use crate::player::input::{InputCommand, InputJobHandle, InputWorker, InputWorkerMessage};
-use crate::player::surface::{FrameQueue, VideoSurface};
+use crate::player::surface::{FrameQueue, FrameQueueView, VideoSurface};
 
 pub struct VideoPlayback {
     frame_queue: Arc<RwLock<FrameQueue>>,
+    frame_queue_view: FrameQueueView,
     master_clock: Box<dyn Clock>,
     sender: Sender<DecodeWorkerMessage>,
     surface: Rc<RefCell<VideoSurface>>,
@@ -29,6 +30,7 @@ pub struct VideoPlayback {
 impl VideoPlayback {
     pub fn new(
         frame_queue: Arc<RwLock<FrameQueue>>,
+        frame_queue_view: FrameQueueView,
         sender: Sender<DecodeWorkerMessage>,
         surface: Rc<RefCell<VideoSurface>>,
         master_clock: Box<dyn Clock>
@@ -43,6 +45,7 @@ impl VideoPlayback {
             serial: None,
             frame_timer: None,
             seek: None,
+            frame_queue_view,
             begin: Instant::now(),
             surface,
             skips: 0
@@ -195,7 +198,7 @@ pub struct VideoPlayer {
 }
 
 impl VideoPlayer {
-    pub fn new(input: Input, video_surface: Option<Rc<RefCell<VideoSurface>>>, decode_worker: &mut DecodeWorker, input_worker: &mut InputWorker) -> VideoPlayer {
+    pub fn new(input: Input, video_surface: Option<Rc<RefCell<VideoSurface>>>, decode_worker: &mut DecodeWorker, input_worker: &mut InputWorker) -> Option<VideoPlayer> {
         let audio_stream = input
             .streams
             .iter()
@@ -225,18 +228,18 @@ impl VideoPlayer {
                 AudioDevice::default_device(ring, sender).unwrap()
             })
         } else {
-            todo!()
+            return None
         };
         let video_playback = if let Some(video_stream) = &video_stream && let Some(video_surface) = video_surface {
             let (queue, sender) = decode_worker.add_decode_job(video_stream, Some((44100, 1)), &handle);
             let (queue, view) = queue.unwrap_video();
-            let playback = VideoPlayback::new(queue, sender, video_surface.clone(), playback_clock.unwrap());
+            let playback = VideoPlayback::new(queue, view, sender, video_surface.clone(), playback_clock.unwrap());
             Some(playback)
         } else { None };
 
         handle.notify_begin();
 
-        VideoPlayer {
+        Some(VideoPlayer {
             video_playback,
             audio_device,
             video_stream,
@@ -246,7 +249,7 @@ impl VideoPlayer {
             input_worker_sender: input_worker.get_sender(),
             decode_worker_sender: decode_worker.get_sender(),
             estimated_duration,
-        }
+        })
     }
 
     pub fn render_update(&mut self) {

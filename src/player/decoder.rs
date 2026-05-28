@@ -1,21 +1,18 @@
-use std::collections::HashMap;
-use std::mem::transmute;
-use std::slice::Iter;
-use std::sync::{mpsc, Arc, Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
-use std::thread::JoinHandle;
-use std::time::{Instant, SystemTime};
-use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_S16;
-use ffmpeg_sys_next::{register_t, AV_TIME_BASE};
 use crate::ffmpeg::current_time;
 use crate::ffmpeg::decode::{AudioConverter, Decoder, DecoderResult};
 use crate::ffmpeg::frame::{AudioFrame, Frame};
-use crate::ffmpeg::input::{Input, Stream, StreamType};
-use crate::player::clock::{Clock, GenClock};
+use crate::ffmpeg::input::{Stream, StreamType};
+use crate::player::clock::{AtomicF64, AtomicInstant, Clock};
 use crate::player::decoder::FrameConsumer::{AudioConsumer, VideoConsumer};
-use crate::player::input::{InputCommand, InputJobHandle, InputWorker, InputWorkerMessage, PacketQueue, PacketQueueView};
+use crate::player::input::{InputJobHandle, PacketQueue, PacketQueueView};
 use crate::player::surface::{FrameQueue, FrameQueueView};
+use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_S16;
+use std::mem::transmute;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{mpsc, Arc, RwLock};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 pub struct AudioRingBuffer {
     buffer: Vec<i16>,
@@ -24,10 +21,10 @@ pub struct AudioRingBuffer {
 
     view: AudioRingView,
 
-    pts: Arc<AtomicU64>,
+    pts: Arc<AtomicF64>,
     samples_read: Arc<AtomicUsize>,
-    last_read: Arc<AtomicU64>,
-    seek: Arc<AtomicU64>,
+    last_read: Arc<AtomicInstant>,
+    seek: Arc<AtomicF64>,
 
     pub latency: Option<f64>,
 
@@ -81,9 +78,9 @@ impl AudioRingBuffer {
             },
 
             samples_read: Arc::new(AtomicUsize::new(0)),
-            pts: Arc::new(AtomicU64::new(0)),
-            last_read: Arc::new(AtomicU64::new(0)),
-            seek: Arc::new(AtomicU64::new(0)),
+            pts: Arc::new(AtomicF64::new(0.0)),
+            last_read: Arc::new(AtomicInstant::now()),
+            seek: Arc::new(AtomicF64::new(-1.0)),
 
             latency: None,
             skips: 0,
@@ -105,7 +102,7 @@ impl AudioRingBuffer {
     pub fn read_to(&mut self, dest: &mut [i16]) -> usize {
         let to_copy = dest.len().min(self.view.size());
         self.samples_read.fetch_add(to_copy, Ordering::SeqCst);
-        self.last_read.store(current_time(), Ordering::SeqCst);
+        self.last_read.set_now(Ordering::SeqCst);
         for i in 0..to_copy {
             dest[i] = self.buffer[self.read_index];
             self.read_index = (self.read_index + 1) % self.buffer.len();
@@ -117,8 +114,8 @@ impl AudioRingBuffer {
     pub fn write_from(&mut self, src: &[i16], pts: f64, serial: u32) -> usize {
         if self.view.serial() != serial {
             self.view.serial.store(serial, Ordering::SeqCst);
-            self.pts.store(unsafe { transmute(pts) }, Ordering::SeqCst);
-            self.last_read.store(current_time(), Ordering::SeqCst);
+            self.pts.store(pts, Ordering::SeqCst);
+            self.last_read.set_now(Ordering::SeqCst);
             self.samples_read.store(0, Ordering::SeqCst);
             self.view.size.store(0, Ordering::SeqCst);
             self.read_index = 0;
@@ -128,15 +125,15 @@ impl AudioRingBuffer {
         let to_copy = src.len().min(self.remaining_space());
 
         let time = to_copy as f64 / (self.sample_rate as f64 * self.channels as f64);
-        let seek: f64 = unsafe { transmute(self.seek.load(Ordering::SeqCst)) };
+        let seek: f64 = self.seek.load(Ordering::SeqCst);
         if seek >= 0.0 {
             if pts < seek && pts + time < seek {
-                self.pts.store(unsafe { transmute(pts + time) }, Ordering::SeqCst);
-                self.last_read.store(current_time(), Ordering::SeqCst);
+                self.pts.store(pts + time, Ordering::SeqCst);
+                self.last_read.set_now(Ordering::SeqCst);
                 self.skips += 1;
                 return to_copy;
             } else {
-                self.seek.store(unsafe { transmute(-1.0f64) }, Ordering::SeqCst);
+                self.seek.store(-1.0f64, Ordering::SeqCst);
                 self.skips = 0;
             }
         }
@@ -173,11 +170,11 @@ impl AudioRingBuffer {
 
 pub struct AudioRingClock {
     serial: Arc<AtomicU32>,
-    pts: Arc<AtomicU64>,
+    pts: Arc<AtomicF64>,
     samples_read: Arc<AtomicUsize>,
-    last_read: Arc<AtomicU64>,
+    last_read: Arc<AtomicInstant>,
     closed: Arc<AtomicBool>,
-    seek: Arc<AtomicU64>,
+    seek: Arc<AtomicF64>,
     sample_rate: u32,
     channels: u16,
 }
@@ -188,21 +185,27 @@ impl Clock for AudioRingClock {
     }
 
     fn pts(&self) -> f64 {
-        let pts: f64 = unsafe { transmute(self.pts.load(Ordering::SeqCst)) };
+        let pts: f64 = self.pts.load(Ordering::SeqCst);
         let read_secs = self.samples_read.load(Ordering::SeqCst) as f64 / (self.sample_rate as f64 * self.channels as f64);
         pts + read_secs
     }
 
     fn pts_interpolated(&self) -> f64 {
-        let pts: f64 = unsafe { transmute(self.pts.load(Ordering::SeqCst)) };
+        let pts: f64 = self.pts.load(Ordering::SeqCst);
         let read_secs = self.samples_read.load(Ordering::SeqCst) as f64 / (self.sample_rate as f64 * self.channels as f64);
-        let inter = (current_time() - self.last_read.load(Ordering::SeqCst)) as f64 / AV_TIME_BASE as f64;
-        pts + read_secs + inter
+        let inter = self.last_read.elapsed(Ordering::SeqCst);
+        pts + read_secs + inter.as_secs_f64().max(0.0)
     }
 
     fn set_seek_flag(&self, seek: f64) {
-        self.seek.store(unsafe { transmute(seek) }, Ordering::SeqCst);
+        self.seek.store(seek, Ordering::SeqCst);
     }
+
+    fn is_ext(&self) -> bool {
+        false
+    }
+
+    fn sync_ext(&self, pts: f64) {}
 }
 
 #[derive(Clone)]
@@ -499,7 +502,7 @@ impl DecodeWorker {
                 }
             },
             StreamType::Video => {
-                let frame_queue = FrameQueue::new(15);
+                let frame_queue = FrameQueue::new(7);
                 let view = frame_queue.view();
                 let frame_queue = VideoConsumer(Arc::new(RwLock::new(frame_queue)), view);
                 let packet_queue_view = queue.read().unwrap().view();

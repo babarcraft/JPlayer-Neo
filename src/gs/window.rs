@@ -10,6 +10,7 @@ pub trait WindowHandler {
     fn initialize(&mut self, window: &mut Window);
     fn render(&mut self, dt: f32, window: &mut Window);
     fn handle_key(&mut self, key: Key, action: Action, window: &Window);
+    fn handle_char(&mut self, c: char, window: &Window);
     fn handle_mouse_button(&mut self, button: MouseButton, action: Action, window: &Window);
     fn handle_mouse_position(&mut self, x: f32, y: f32, window: &Window);
 }
@@ -35,6 +36,7 @@ impl Window {
         window.set_key_polling(true);
         window.set_mouse_button_polling(true);
         window.set_cursor_pos_polling(true);
+        window.set_char_polling(true);
         window.set_framebuffer_size_polling(true);
         window.set_size_polling(true);
 
@@ -67,7 +69,7 @@ impl Window {
                         handler.handle_key(key, action, self);
                     }
                     glfw::WindowEvent::Char(character) => {
-                        println!("{}", character);
+                        handler.handle_char(character, self);
                     }
                     glfw::WindowEvent::FramebufferSize(width, height) => {
                         unsafe {
