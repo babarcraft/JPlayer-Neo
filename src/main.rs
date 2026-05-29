@@ -4,7 +4,7 @@ pub mod player;
 
 use crate::ffmpeg::frame::Frame;
 use crate::gs::gl::clear_current_buffer_color;
-use crate::gs::nvg::{Color, NvgContext, Shape, Text};
+use crate::gs::nvg::{Color, NvgContext, Point, Shape, Text};
 use crate::gs::window::{Window, WindowHandler};
 use crate::player::decoder::DecodeWorker;
 use crate::player::input::InputWorker;
@@ -32,6 +32,7 @@ struct App {
     last_decode_passes: usize,
     last_input_passes: usize,
     timeline_bounds: ((f32, f32), (f32, f32)),
+    text_index: usize
 }
 
 impl App {
@@ -41,9 +42,8 @@ impl App {
         let mut nvg_context = NvgContext::new();
 
         nvg_context.load_font("default", "src/res/def.ttf");
-        nvg_context.set_font("default", 64.0);
 
-        let text = nvg_context.text(100.0, 100.0, "Input: ");
+        let text = nvg_context.text("Input: ", "default", 64.0);
         Self {
             frame_sw: Frame::new(),
             video_surface,
@@ -60,6 +60,7 @@ impl App {
             current_page: 15,
             test_img: None,
             timeline_bounds: ((0.0, 0.0), (0.0, 0.0)),
+            text_index: 0
         }
     }
 }
@@ -76,6 +77,8 @@ impl WindowHandler for App {
 
         let (w, h) = window.get_size();
         self.nvg_context.frame((w, h), |context| {
+            self.text_index = self.text_index.max(0).min(self.text.len());
+
             context.update_text(&mut self.text);
             
             let text = &self.text;
@@ -86,7 +89,23 @@ impl WindowHandler for App {
             context.begin_path();
             context.fill_shape_color(Shape::Rect(0.0, 0.0, 100.0, 100.0), Color::gray(0.5, 1.0));
             let (x, y, w, h) = text.bounds();
-            context.fill_shape_color(Shape::Rect(x, y, w, h), Color::rgb(0.0, 1.0, 1.0).alpha(0.5));
+            let text_rect = Shape::Rect(x, y, w, h);
+            context.fill_shape_color(text_rect, Color::rgb(0.0, 1.0, 1.0).alpha(0.5));
+            context.fill_shape_color(text_rect.with_padding(20.0, true), Color::rgb(0.4, 1.0, 1.0).alpha(0.3));
+
+            context.begin_path();
+            context.draw_line(Point::new(text.x, text.y), Point::new(x + w, y));
+            context.stroke_color(Color::rgba(1.0, 0.0, 0.0, 1.0));
+            context.stroke_width(2.0);
+            context.stroke();
+
+            if let Some((x, y, xf, yf)) = text.char_bounds_absolute(self.text_index) {
+                context.begin_path();
+                context.draw_line(Point::new(x, y), Point::new(x, yf));
+                context.stroke_color(Color::rgba(1.0, 0.0, 0.0, 1.0));
+                context.stroke_width(2.0);
+                context.stroke();
+            }
         });
     }
 
@@ -103,6 +122,7 @@ impl WindowHandler for App {
             }
             Key::Right => {
                 if action == Action::Press {
+                    self.text_index = (self.text_index + 1).max(0).min(self.text.len());
                     if let Some(video_player) = self.video_player.as_mut() {
                         video_player.seek(video_player.current_pts() + 5.0)
                     }
@@ -110,6 +130,9 @@ impl WindowHandler for App {
             }
             Key::Left => {
                 if action == Action::Press {
+                    if self.text_index > 0 {
+                        self.text_index = (self.text_index - 1).max(0).min(self.text.len());
+                    }
                     if let Some(video_player) = self.video_player.as_mut() {
                         video_player.seek(video_player.current_pts() - 5.0)
                     }
@@ -132,12 +155,21 @@ impl WindowHandler for App {
                 if action == Action::Press {
                 }
             }
+            Key::Backspace => {
+                if action == Action::Press || action == Action::Repeat {
+                    if self.text_index > 0 {
+                        self.text_index -= 1;
+                        self.text.remove_at(self.text_index);
+                    }
+                }
+            }
             _ => {}
         }
     }
 
     fn handle_char(&mut self, c: char, window: &Window) {
-        self.text.push_back(c)
+        self.text.insert_at(self.text_index, c);
+        self.text_index = (self.text_index + 1).max(0).min(self.text.len());
     }
 
     fn handle_mouse_button(&mut self, button: MouseButton, action: Action, window: &Window) {
@@ -157,6 +189,7 @@ impl WindowHandler for App {
     }
 
     fn handle_mouse_position(&mut self, x: f32, y: f32, window: &Window) {
+        self.text.set_position(x, y);
     }
 }
 
