@@ -2,65 +2,94 @@ mod ffmpeg;
 pub mod gs;
 pub mod player;
 
+use std::process::Child;
 use crate::ffmpeg::frame::Frame;
 use crate::gs::gl::clear_current_buffer_color;
-use crate::gs::nvg::{Color, NvgContext, Point, Shape, Text};
+use crate::gs::nvg::{Color, NvgContext, Point, Shape, Text, TextHorizontalAlignment, TextVerticalAlignment};
 use crate::gs::window::{Window, WindowHandler};
 use crate::player::decoder::DecodeWorker;
 use crate::player::input::InputWorker;
 use crate::player::player::VideoPlayer;
 use crate::player::surface::VideoSurface;
-use glfw::{Action, Key, MouseButton};
+use glfw::{Action, Key, MouseButton, WindowEvent};
 use std::cell::RefCell;
+use std::f32::consts::PI;
 use std::rc::Rc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
+use ffmpeg_sys_next::{labs, perror};
+use crate::ffmpeg::input::Input;
 use crate::gs::nvg;
+use crate::player::ui::{Component, ComponentBody, ComponentId, ComponentManager};
 
 struct App {
-    frame_sw: Frame,
     input_worker: InputWorker,
     decode_worker: DecodeWorker,
-    video_surface: Rc<RefCell<VideoSurface>>,
-    video_player: Option<VideoPlayer>,
-    nvg_image: Option<i32>,
-    test_img: Option<i32>,
-    text: Text,
     nvg_context: NvgContext,
-    current_index: usize,
-    current_page: usize,
-    begin: Instant,
-    last_decode_passes: usize,
-    last_input_passes: usize,
-    timeline_bounds: ((f32, f32), (f32, f32)),
-    text_index: usize
+    component_manager: ComponentManager,
+
+    controls_timeline: ComponentId,
+    controls_time_passed: ComponentId,
+    controls_time_rem: ComponentId,
+    controls_root: ComponentId,
+    player: VideoPlayer,
+    video_surface: ComponentId,
+    stats: ComponentId
 }
 
 impl App {
     pub fn new() -> Self {
-        let surface = VideoSurface::new();
-        let video_surface = Rc::new(RefCell::new(surface));
         let mut nvg_context = NvgContext::new();
 
         nvg_context.load_font("default", "src/res/def.ttf");
 
-        let text = nvg_context.text("Input: ", "default", 64.0);
+        let mut component_manager = ComponentManager::new();
+
+        let surface = Rc::new(RefCell::new(VideoSurface::new()));
+
+        let video_surface = component_manager.push(Component::video_surface(surface.clone()));
+        let controls_timeline = component_manager.push(Component::slider(Color::gray(0.4, 1.0), Color::gray(0.7, 1.0)));
+        let controls_time_passed = component_manager.push(Component::label(&mut nvg_context, Color::gray(1.0, 1.0), (TextHorizontalAlignment::Left, TextVerticalAlignment::Center)));
+        let controls_time_rem = component_manager.push(Component::label(&mut nvg_context, Color::gray(1.0, 1.0), (TextHorizontalAlignment::Right, TextVerticalAlignment::Center)));
+        let stats = component_manager.push(Component::label(&mut nvg_context, Color::gray(1.0, 1.0), (TextHorizontalAlignment::Center, TextVerticalAlignment::Center)));
+
+        let hg = component_manager.push(Component::hgroup(vec![
+            (1.0, Some(controls_time_passed)),
+            (3.0, None),
+            (1.0, Some(controls_time_rem)),
+        ]));
+        let vg = component_manager.push(Component::vgroup(vec![
+            (5.0, Some(stats)),
+            (2.0, Some(hg)),
+            (0.75, None),
+            (3.0, Some(controls_timeline)),
+            (5.0, None),
+        ]).with_padding(15.0));
+        let back_rect = component_manager.push(Component::rect(Color::rgb(1.0, 0.5, 0.0)));
+        let controls_root = component_manager.push(Component::root(vec![back_rect, vg]).with_padding(25.0).with_preferred_size(None, Some(200.0)));
+        let root = component_manager.push(Component::root(vec![video_surface, controls_root]));
+
+        component_manager.set_root(root);
+
+        let mut input_worker = InputWorker::new();
+        let mut decode_worker = DecodeWorker::new();
+        let input = Input::open("tt.webm", &[]).unwrap();
+        let mut player = VideoPlayer::new(input, Some(&mut *surface.borrow_mut()), &mut decode_worker, &mut input_worker).unwrap();
+        player.play();
+
         Self {
-            frame_sw: Frame::new(),
-            video_surface,
-            nvg_image: None,
-            video_player: None,
-            input_worker: InputWorker::new(),
-            decode_worker: DecodeWorker::new(),
+            input_worker,
+            decode_worker,
             nvg_context,
-            text,
-            begin: Instant::now(),
-            last_decode_passes: 0,
-            last_input_passes: 0,
-            current_index: 0,
-            current_page: 15,
-            test_img: None,
-            timeline_bounds: ((0.0, 0.0), (0.0, 0.0)),
-            text_index: 0
+            component_manager,
+            player,
+
+            video_surface,
+            controls_timeline,
+            controls_time_passed,
+            controls_time_rem,
+            controls_root,
+            stats
         }
     }
 }
@@ -71,125 +100,47 @@ impl WindowHandler for App {
     fn render(&mut self, dt: f32, window: &mut Window) {
         clear_current_buffer_color();
 
-        if let Some(playback) = &mut self.video_player {
-            playback.render_update();
+        let (w, h) = window.get_size();
+
+        if let Some(ComponentBody::Label { text, .. }) = self.component_manager.get_mut_body(self.controls_time_passed) {
+            text.clear();
+            let mut seconds = self.player.master_clock.pts();
+            let hours = (seconds / 3600.0) as u32;
+            seconds -= hours as f64 * 3600.0;
+            let minutes = (seconds / 60.0) as u32;
+            seconds -= minutes as f64 * 60.0;
+            let seconds = seconds as u32;
+            text.push_str(&format!("{:02}:{:02}:{:02}", hours, minutes, seconds));
+        }
+        if let Some(ComponentBody::Label { text, .. }) = self.component_manager.get_mut_body(self.controls_time_rem) {
+            text.clear();
+            let mut seconds = self.player.estimated_duration - self.player.master_clock.pts();
+            let hours = (seconds / 3600.0) as u32;
+            seconds -= hours as f64 * 3600.0;
+            let minutes = (seconds / 60.0) as u32;
+            seconds -= minutes as f64 * 60.0;
+            let seconds = seconds as u32;
+            text.push_str(&format!("-{:02}:{:02}:{:02}", hours, minutes, seconds));
+        }
+        if let Some(ComponentBody::Label { text, .. }) = self.component_manager.get_mut_body(self.stats) {
+            text.clear();
+            text.push_str(&format!("Input passes: {:012} Decode passes: {:012}", self.input_worker.passes.load(Ordering::Relaxed), self.decode_worker.passes.load(Ordering::Relaxed)));
+        }
+        if let Some(ComponentBody::Slider { percent, target, foreground, background }) =
+            self.component_manager.get_mut_body(self.controls_timeline) {
+            *percent = (self.player.master_clock.pts() / self.player.estimated_duration) as f32;
+            if let Some(target) = target.take() {
+                self.player.seek(target as f64 * self.player.estimated_duration);
+            }
         }
 
-        let (w, h) = window.get_size();
         self.nvg_context.frame((w, h), |context| {
-            self.text_index = self.text_index.max(0).min(self.text.len());
-
-            context.update_text(&mut self.text);
-            
-            let text = &self.text;
-            context.begin_path();
-            context.fill_color(nvg::Color::gray(1.0, 1.0));
-            context.draw_text(text);
-            context.fill();
-            context.begin_path();
-            context.fill_shape_color(Shape::Rect(0.0, 0.0, 100.0, 100.0), Color::gray(0.5, 1.0));
-            let (x, y, w, h) = text.bounds();
-            let text_rect = Shape::Rect(x, y, w, h);
-            context.fill_shape_color(text_rect, Color::rgb(0.0, 1.0, 1.0).alpha(0.5));
-            context.fill_shape_color(text_rect.with_padding(20.0, true), Color::rgb(0.4, 1.0, 1.0).alpha(0.3));
-
-            context.begin_path();
-            context.draw_line(Point::new(text.x, text.y), Point::new(x + w, y));
-            context.stroke_color(Color::rgba(1.0, 0.0, 0.0, 1.0));
-            context.stroke_width(2.0);
-            context.stroke();
-
-            if let Some((x, y, xf, yf)) = text.char_bounds_absolute(self.text_index) {
-                context.begin_path();
-                context.draw_line(Point::new(x, y), Point::new(x, yf));
-                context.stroke_color(Color::rgba(1.0, 0.0, 0.0, 1.0));
-                context.stroke_width(2.0);
-                context.stroke();
-            }
+            self.component_manager.render_root(context);
         });
     }
 
-    fn handle_key(&mut self, key: Key, action: Action, window: &Window) {
-        match key {
-            Key::Escape => {
-                if action == Action::Press {
-                    self.video_player.take();
-                }
-            }
-            Key::Enter => {
-                if action == Action::Press {
-                }
-            }
-            Key::Right => {
-                if action == Action::Press {
-                    self.text_index = (self.text_index + 1).max(0).min(self.text.len());
-                    if let Some(video_player) = self.video_player.as_mut() {
-                        video_player.seek(video_player.current_pts() + 5.0)
-                    }
-                }
-            }
-            Key::Left => {
-                if action == Action::Press {
-                    if self.text_index > 0 {
-                        self.text_index = (self.text_index - 1).max(0).min(self.text.len());
-                    }
-                    if let Some(video_player) = self.video_player.as_mut() {
-                        video_player.seek(video_player.current_pts() - 5.0)
-                    }
-                }
-            }
-
-            Key::Space => {
-                if action == Action::Press {
-                    if let Some(video_player) = self.video_player.as_mut() {
-                        if video_player.is_playing() {
-                            video_player.pause();
-                        } else {
-                            video_player.play();
-                        }
-                    }
-                }
-            }
-
-            Key::F => {
-                if action == Action::Press {
-                }
-            }
-            Key::Backspace => {
-                if action == Action::Press || action == Action::Repeat {
-                    if self.text_index > 0 {
-                        self.text_index -= 1;
-                        self.text.remove_at(self.text_index);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_char(&mut self, c: char, window: &Window) {
-        self.text.insert_at(self.text_index, c);
-        self.text_index = (self.text_index + 1).max(0).min(self.text.len());
-    }
-
-    fn handle_mouse_button(&mut self, button: MouseButton, action: Action, window: &Window) {
-        if action != Action::Press {
-            return;
-        }
-        let player = match &mut self.video_player {
-            Some(player) => player,
-            None => return,
-        };
-        let (x, y) = window.mouse_position;
-        let ((tx0, ty0), (tx1, ty1)) = self.timeline_bounds;
-        if x >= tx0 && x <= tx1 && y >= ty0 && y <= ty1 {
-            let percent = (x - tx0) / (tx1 - tx0);
-            player.seek(player.estimated_duration * percent as f64)
-        }
-    }
-
-    fn handle_mouse_position(&mut self, x: f32, y: f32, window: &Window) {
-        self.text.set_position(x, y);
+    fn handle_event(&mut self, event: WindowEvent, window: &Window) {
+        self.component_manager.handle_event(event, window);
     }
 }
 

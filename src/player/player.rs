@@ -16,15 +16,15 @@ pub struct VideoPlayback {
     frame_queue_view: FrameQueueView,
     master_clock: Box<dyn Clock>,
     sender: Sender<DecodeWorkerMessage>,
-    surface: Rc<RefCell<VideoSurface>>,
     pub last_pts: Option<f64>,
     last_duration: f64,
     frame_timer: Option<f64>,
     serial: Option<u32>,
+    pub seek_avoid_serial: Option<u32>,
     pub seek: Option<f64>,
     pub playing: bool,
     begin: Instant,
-    pub(crate) skips: usize,
+    pub(crate) closed: bool,
 }
 
 impl VideoPlayback {
@@ -32,7 +32,6 @@ impl VideoPlayback {
         frame_queue: Arc<RwLock<FrameQueue>>,
         frame_queue_view: FrameQueueView,
         sender: Sender<DecodeWorkerMessage>,
-        surface: Rc<RefCell<VideoSurface>>,
         master_clock: Box<dyn Clock>
     ) -> Self {
         Self {
@@ -47,13 +46,13 @@ impl VideoPlayback {
             seek: None,
             frame_queue_view,
             begin: Instant::now(),
-            surface,
-            skips: 0
+            closed: false,
+            seek_avoid_serial: None,
         }
     }
 
-    pub fn update(&mut self) {
-        if !self.playing {
+    pub fn update(&mut self, video_surface: &mut VideoSurface) {
+        if !self.playing || self.frame_queue_view.serial() != self.master_clock.serial() {
             return;
         }
 
@@ -61,10 +60,9 @@ impl VideoPlayback {
 
         let audio_clock = self.master_clock.pts_interpolated();
 
-        let mut video_surface = self.surface.borrow_mut();
-
         let mut should_pop = false;
         let mut queue_was_full = false;
+
 
         if let Some(queue) = self.frame_queue.try_read().ok() {
             let frame_serial = queue.serial();
@@ -81,66 +79,49 @@ impl VideoPlayback {
 
             if let Some(frame) = queue.peek_read() {
                 let current_pts = frame.pts.unwrap_or(0.0) as f64;
-                let mut skip = false;
 
-                if let Some(seek) = self.seek {
-                    if current_pts < seek.min(audio_clock) {
-                        self.skips += 1;
-                        self.last_pts = Some(current_pts);
-                        skip = true;
-                        should_pop = true;
+                if self.frame_timer.is_none() || self.last_pts.is_none() {
+                    self.frame_timer = Some(current_time);
+                    self.last_pts = Some(current_pts);
+                    self.last_duration = frame.duration.unwrap_or(0.04) as f64;
+
+                    video_surface.upload(frame, &[
+                        InternalFormat::R(8),
+                        InternalFormat::Rg(8),
+                    ], Some(2));
+                    video_surface.convert_output();
+                    should_pop = true;
+                } else {
+                    let last_pts = self.last_pts.unwrap();
+
+                    let (duration, diff, delay) = Self::calculate_delay(self.last_duration, audio_clock, current_pts, last_pts);
+
+                    let target_time = self.frame_timer.unwrap() + delay;
+
+                    if current_time < target_time {
                     } else {
-                        self.seek = None;
-                        self.skips = 0;
-                    }
-                }
+                        self.frame_timer = Some(target_time);
 
-                if !skip {
-                    if self.frame_timer.is_none() || self.last_pts.is_none() {
-                        self.frame_timer = Some(current_time);
-                        self.last_pts = Some(current_pts);
-                        self.last_duration = frame.duration.unwrap_or(0.04) as f64;
+                        if current_time - target_time > 0.1 {
+                            self.frame_timer = Some(current_time);
+                        }
 
-                        video_surface.upload(frame, &[
-                            InternalFormat::R(8),
-                            InternalFormat::Rg(8),
-                        ], Some(2));
-                        video_surface.convert_output();
-                        should_pop = true;
-                    } else {
-                        let last_pts = self.last_pts.unwrap();
-
-                        let (duration, diff, delay) = Self::calculate_delay(self.last_duration, audio_clock, current_pts, last_pts);
-
-                        let target_time = self.frame_timer.unwrap() + delay;
-
-                        if current_time < target_time {
-                        } else {
-                            self.frame_timer = Some(target_time);
-
-                            if current_time - target_time > 0.1 {
-                                self.frame_timer = Some(current_time);
-                            }
-
-                            if diff < -0.1 {
-                                should_pop = true;
-                            } else if diff < 0.4 {
-                                video_surface.upload(frame, &[
-                                    InternalFormat::R(8),
-                                    InternalFormat::Rg(8),
-                                ], Some(2));
-                                video_surface.convert_output();
-                                self.last_pts = Some(current_pts);
-                                self.last_duration = duration;
-                                should_pop = true;
-                            }
+                        if diff < -0.1 {
+                            should_pop = true;
+                        } else if diff < 0.4 {
+                            video_surface.upload(frame, &[
+                                InternalFormat::R(8),
+                                InternalFormat::Rg(8),
+                            ], Some(2));
+                            video_surface.convert_output();
+                            self.last_pts = Some(current_pts);
+                            self.last_duration = duration;
+                            should_pop = true;
                         }
                     }
                 }
             }
         }
-
-        drop(video_surface);
 
         if should_pop {
             self.pop_and_notify(queue_was_full);
@@ -185,7 +166,7 @@ impl Drop for VideoPlayback {
 }
 
 pub struct VideoPlayer {
-    pub video_playback: Option<VideoPlayback>,
+    pub video_playback: Option<Rc<RefCell<VideoPlayback>>>,
     pub audio_device: Option<AudioDevice>,
     pub video_stream: Option<Stream>,
     pub audio_stream: Option<Stream>,
@@ -198,7 +179,7 @@ pub struct VideoPlayer {
 }
 
 impl VideoPlayer {
-    pub fn new(input: Input, video_surface: Option<Rc<RefCell<VideoSurface>>>, decode_worker: &mut DecodeWorker, input_worker: &mut InputWorker) -> Option<VideoPlayer> {
+    pub fn new(input: Input, video_surface: Option<&mut VideoSurface>, decode_worker: &mut DecodeWorker, input_worker: &mut InputWorker) -> Option<VideoPlayer> {
         let audio_stream = input
             .streams
             .iter()
@@ -218,7 +199,7 @@ impl VideoPlayer {
 
         let audio_device = if let Some(audio_stream) = &audio_stream {
             Some({
-                let (queue, sender) = decode_worker.add_decode_job(audio_stream, Some((44100, 1)), &handle);
+                let (queue, sender) = decode_worker.add_decode_job(audio_stream, Some((48000, 1)), &handle);
                 let (ring, view) = queue.unwrap_audio();
                 {
                     let ring = ring.read().unwrap();
@@ -233,7 +214,8 @@ impl VideoPlayer {
         let video_playback = if let Some(video_stream) = &video_stream && let Some(video_surface) = video_surface {
             let (queue, sender) = decode_worker.add_decode_job(video_stream, Some((44100, 1)), &handle);
             let (queue, view) = queue.unwrap_video();
-            let playback = VideoPlayback::new(queue, view, sender, video_surface.clone(), playback_clock.unwrap());
+            let playback = Rc::new(RefCell::new(VideoPlayback::new(queue, view, sender, playback_clock.unwrap())));
+            video_surface.set_playback(playback.clone());
             Some(playback)
         } else { None };
 
@@ -252,18 +234,12 @@ impl VideoPlayer {
         })
     }
 
-    pub fn render_update(&mut self) {
-        if let Some(playback) = self.video_playback.as_mut() {
-            playback.update();
-        }
-    }
-
     pub fn play(&mut self) {
         if let Some(device) = &mut self.audio_device {
             device.play();
         }
         if let Some(playback) = self.video_playback.as_mut() {
-            playback.playing = true;
+            playback.borrow_mut().playing = true;
         }
     }
 
@@ -272,18 +248,19 @@ impl VideoPlayer {
             device.pause();
         }
         if let Some(playback) = self.video_playback.as_mut() {
-            playback.playing = false;
+            playback.borrow_mut().playing = false;
         }
     }
 
     pub fn seek(&mut self, target: f64) {
         self.input_job_handle.seek(0.0, target, None);
-        self.input_worker_sender.send(InputWorkerMessage::Update).unwrap();
-        self.decode_worker_sender.send(DecodeWorkerMessage::Wakeup).unwrap();
         self.master_clock.set_seek_flag(target);
         if let Some(playback) = &mut self.video_playback {
-            playback.seek = Some(target);
+            let playback = playback.borrow_mut();
+            playback.frame_queue_view.set_seek(target);
         }
+        self.decode_worker_sender.send(DecodeWorkerMessage::Wakeup).unwrap();
+        self.input_worker_sender.send(InputWorkerMessage::Update).unwrap();
     }
 
     pub fn current_pts(&self) -> f64 {
@@ -299,8 +276,16 @@ impl VideoPlayer {
             return device.is_playing()
         }
         if let Some(playback) = self.video_playback.as_ref() {
-            return playback.playing
+            return playback.borrow_mut().playing
         }
         false
+    }
+}
+
+impl Drop for VideoPlayer {
+    fn drop(&mut self) {
+        if let Some(playback) = &mut self.video_playback {
+            playback.borrow_mut().closed = true;
+        }
     }
 }

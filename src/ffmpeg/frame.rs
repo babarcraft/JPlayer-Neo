@@ -276,7 +276,8 @@ impl AudioFrame {
 
     pub fn plane<T>(&self, num: usize) -> &[T] {
         unsafe {
-            std::slice::from_raw_parts(self.planes[num] as *const T, self.plane_sizes[num].unwrap() / size_of::<T>())
+            let actual = (self.num_samples * self.channels) / self.num_planes.max(1);
+            std::slice::from_raw_parts(self.planes[num] as *const T, actual)
         }
     }
 

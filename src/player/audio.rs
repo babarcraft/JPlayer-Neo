@@ -26,12 +26,12 @@ impl AudioDevice {
             let buffer = ring_buffer.write().unwrap();
             let channels = buffer.channels;
             let sample_rate = buffer.sample_rate;
-            let buffer_size = 128 * channels as u32;
+            let buffer_size = 128 * sample_rate * channels as u32;
             // buffer.latency = Some((buffer_size as f64 / sample_rate as f64));
             StreamConfig {
                 channels,
                 sample_rate,
-                buffer_size: BufferSize::Fixed(buffer_size),
+                buffer_size: BufferSize::Default,
             }
         };
 
@@ -43,11 +43,15 @@ impl AudioDevice {
             let sender = sender.clone();
             let playing = playing.clone();
             device.build_output_stream(&config, move |output: &mut [i16], info: &cpal::OutputCallbackInfo| {
-                if view.size() < output.len() || !playing.load(Ordering::Relaxed) {
+                let playing = playing.load(Ordering::Relaxed);
+                if view.size() < output.len() || !playing {
                     output.fill(0);
                 } else {
                     let read = ring_buffer.write().unwrap().read_to(output);
                     output[read..].fill(0);
+                }
+
+                if playing {
                     sender.send(DecodeWorkerMessage::Wakeup).unwrap();
                 }
             }, move |error| {}, None).unwrap()

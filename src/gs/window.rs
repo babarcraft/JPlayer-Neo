@@ -2,17 +2,14 @@ use std::collections::HashMap;
 use std::mem::replace;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
-use glfw::{Action, Context, Glfw, GlfwReceiver, Key, MouseButton, PWindow, WindowEvent, WindowHint};
+use glfw::{Action, Context, FlushedMessages, Glfw, GlfwReceiver, Key, MouseButton, PWindow, WindowEvent, WindowHint};
 use crate::gs::gl::{check_errors, ErrorType};
 use crate::gs::shader::UniformValue;
 
 pub trait WindowHandler {
     fn initialize(&mut self, window: &mut Window);
     fn render(&mut self, dt: f32, window: &mut Window);
-    fn handle_key(&mut self, key: Key, action: Action, window: &Window);
-    fn handle_char(&mut self, c: char, window: &Window);
-    fn handle_mouse_button(&mut self, button: MouseButton, action: Action, window: &Window);
-    fn handle_mouse_position(&mut self, x: f32, y: f32, window: &Window);
+    fn handle_event(&mut self, event: WindowEvent, window: &Window);
 }
 
 pub struct Window {
@@ -63,30 +60,16 @@ impl Window {
         while !self.window.should_close() {
             self.glfw.poll_events();
 
-            for (_, event) in glfw::flush_messages(&self.events) {
+            for (time, event) in glfw::flush_messages(&self.events) {
                 match event {
-                    glfw::WindowEvent::Key(key, _scancode, action, _mods) => {
-                        handler.handle_key(key, action, self);
-                    }
-                    glfw::WindowEvent::Char(character) => {
-                        handler.handle_char(character, self);
-                    }
                     glfw::WindowEvent::FramebufferSize(width, height) => {
                         unsafe {
                             gl::Viewport(0, 0, width, height);
                         }
                     }
-                    glfw::WindowEvent::Size(w, h) => {
-                    }
-                    glfw::WindowEvent::MouseButton(button, action, _) => {
-                        handler.handle_mouse_button(button, action, self);
-                    }
-                    glfw::WindowEvent::CursorPos(x, y) => {
-                        self.mouse_position = (x as f32, self.window.get_size().1 as f32 - y as f32);
-                        handler.handle_mouse_position(self.mouse_position.0, self.mouse_position.1, self);
-                    }
                     _ => {}
                 }
+                handler.handle_event(event, self);
             }
             
             if let Some(time) = last.take() {
@@ -100,6 +83,10 @@ impl Window {
 
             self.window.swap_buffers();
         }
+    }
+    
+    pub fn events(&self) -> FlushedMessages<'_, (f64, WindowEvent)> {
+        glfw::flush_messages(&self.events)
     }
 
     pub fn get_clipboard(&self) -> Option<String> {

@@ -195,23 +195,12 @@ impl Input {
 
     pub fn read_packet(&mut self) -> Result<Packet, Error> {
         let mut packet = Packet::new(self.serial, self.id);
-        if self.after_seek {
-        }
         if let Err(error) = packet.read_from(self.context) {
             if error.is_eof() {
-                println!("ERROR EOF")
+                self.restart()?;
+                self.eof = true;
             }
-            if error.is_eof() && self.after_seek {
-                self.after_seek = false;
-                println!("First EOF, no problem mate");
-                return Err(error);
-            }
-            println!("Second EOF... Yes problem");
-            self.after_seek = false;
-            self.eof = error.is_eof();
             return Err(error);
-        }
-        if self.after_seek {
         }
         Ok(packet)
     }
@@ -231,17 +220,9 @@ impl Input {
                 AVSEEK_FLAG_BACKWARD
             );
             if result < 0 {
-                if self.eof {
-                    if let Err(error) = self.restart() {
-                        return Err(error);
-                    }
-                    return self.seek(min, max, stream_index)
-                }
                 return Err(Error::from_code(result));
             }
             self.eof = false;
-            self.after_seek = true;
-            self.flush();
             self.serial += 1;
             Ok(())
         }

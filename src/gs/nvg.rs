@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::os::raw::c_char;
 use std::ptr::{null, null_mut};
 use std::str::FromStr;
-use nanovg_sys::{nvgBeginFrame, nvgBeginPath, nvgCircle, nvgCreateFont, nvgCreateGL3, nvgCreateImage, nvgCreateImageRGBA, nvgDeleteImage, nvgEndFrame, nvgFill, nvgFillColor, nvgFillPaint, nvgFontFace, nvgFontSize, nvgImagePattern, nvgLineTo, nvgMoveTo, nvgRect, nvgStroke, nvgStrokeColor, nvgStrokeWidth, nvgText, nvgTextGlyphPositions, nvgTextMetrics, nvglCreateImageFromHandleGL3, NVGcolor, NVGglyphPosition, NVGpaint};
+use nanovg_sys::{nvgBeginFrame, nvgBeginPath, nvgCircle, nvgCreateFont, nvgCreateGL3, nvgCreateImage, nvgCreateImageRGBA, nvgDeleteImage, nvgEndFrame, nvgFill, nvgFillColor, nvgFillPaint, nvgFontFace, nvgFontSize, nvgImagePattern, nvgIntersectScissor, nvgLineTo, nvgMoveTo, nvgRect, nvgRestore, nvgRotate, nvgSave, nvgScale, nvgScissor, nvgStroke, nvgStrokeColor, nvgStrokeWidth, nvgText, nvgTextGlyphPositions, nvgTextMetrics, nvgTranslate, nvglCreateImageFromHandleGL3, NVGcolor, NVGglyphPosition, NVGpaint};
 use crate::gs::texture::Texture;
 
 pub struct NvgContext {
@@ -122,7 +122,7 @@ impl Shape {
         match *self {
             Shape::Rect(x, y, w, h) => {
                 if centered {
-                    Shape::Rect(x - padding / 2.0, y - padding / 2.0, w + padding, h + padding)
+                    Shape::Rect(x + padding / 2.0, y + padding / 2.0, w - padding, h - padding)
                 } else {
                     Shape::Rect(x, y, w + padding, h + padding)
                 }
@@ -132,7 +132,20 @@ impl Shape {
             }
         }
     }
+}
 
+#[derive(Copy, Clone, Debug)]
+pub enum TextHorizontalAlignment {
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum TextVerticalAlignment {
+    Top,
+    Center,
+    Bottom,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +157,7 @@ pub struct Text {
     glyph_positions: Vec<NVGglyphPosition>,
     matrics: TextMatrics,
     dirty: bool,
+    fit: bool,
     pub(crate) x: f32,
     pub(crate) y: f32,
 }
@@ -162,6 +176,7 @@ impl TextMatrics {
 }
 
 impl Text {
+    
     pub fn bounds(&self) -> (f32, f32, f32, f32) {
         let w = self.glyph_positions.last()
             .zip(self.glyph_positions.first())
@@ -237,6 +252,17 @@ impl Text {
         self.glyph_positions.remove(index);
         self.dirty = true;
     }
+
+    pub fn push_str(&mut self, str: &str) {
+        self.data.extend(str.chars());
+        self.dirty = true;
+    }
+
+    pub fn clear(&mut self) {
+        self.data.clear();
+        self.glyph_positions.clear();
+        self.dirty = true;
+    }
     
     pub fn pop(&mut self) -> Option<(char, NVGglyphPosition)> {
         let char = self.data.pop().zip(self.glyph_positions.pop());
@@ -264,6 +290,7 @@ impl Text {
             glyph_positions: new_glyphs,
             matrics: self.matrics,
             dirty: true,
+            fit: false,
             x: self.x,
             y: self.y,
         })
@@ -290,6 +317,14 @@ impl Image {
         (sw * s, sh * s)
     }
 
+}
+
+pub fn string_to_ptr_end(string: &str) -> (*const c_char, *const c_char) {
+    unsafe {
+        let ptr = string.as_ptr() as *const c_char;
+        let end = ptr.add(string.len());
+        (ptr, end)
+    }
 }
 
 impl NvgContext {
@@ -328,10 +363,31 @@ impl NvgContext {
     pub fn draw_text(&mut self, text: &Text) {
         unsafe {
             let data = &text.data;
-            let ptr = data.as_ptr() as *const c_char;
-            let end = data.as_ptr().add(data.len()) as *const c_char;
+            let (ptr, end) = string_to_ptr_end(data);
             self.set_font(text.font.as_str(), text.font_size);
             nvgText(self.context, text.x, self.invert_y(text.y, 0.0), ptr, end);
+        }
+    }
+
+    pub fn draw_text_inside(&mut self, text: &Text, shape: Shape, horizontal: TextHorizontalAlignment, vertical: TextVerticalAlignment) {
+        let (sx, sy, sw, sh) = shape.bounds();
+        let (tx, ty, tw, th) = text.bounds();
+        let dx = sx - tx;
+        let dy = sy - ty;
+        let ox = (sw - tw) * match horizontal {
+            TextHorizontalAlignment::Left => 0.0,
+            TextHorizontalAlignment::Center => 0.5,
+            TextHorizontalAlignment::Right => 1.0,
+        };
+        let oy = (sh - th) * match vertical {
+            TextVerticalAlignment::Top => 0.0,
+            TextVerticalAlignment::Center => 0.5,
+            TextVerticalAlignment::Bottom => 1.0,
+        };
+        unsafe {
+            let (ptr, end) = string_to_ptr_end(&text.data);
+            nvgFontSize(self.context, text.font_size);
+            nvgText(self.context, dx + ox, self.invert_y(dy + oy, 0.0), ptr, end);
         }
     }
 
@@ -352,6 +408,7 @@ impl NvgContext {
     
     pub fn update_text(&mut self, text: &mut Text) {
         self.set_font(text.font.as_str(), text.font_size);
+        text.matrics = self.text_matrics;
         if text.glyph_positions.len() == text.data.len() && !text.dirty {
             return;
         }
@@ -383,6 +440,29 @@ impl NvgContext {
         text.dirty = false
     }
 
+    pub fn fit_text(&mut self, text: &mut Text, pw: f32, ph: f32) {
+        if text.fit && !text.dirty {
+            return
+        }
+        let mut bigger = false;
+        loop {
+            text.dirty = true;
+            self.update_text(text);
+            let (x, y, w, h) = text.bounds();
+            if w > pw || h > ph {
+                bigger = true;
+                text.font_size -= 1.0;
+            } else if bigger {
+                break
+            } else {
+                bigger = false;
+                text.font_size += 1.0;
+            }
+        }
+        text.fit = true;
+        text.dirty = false;
+    }
+
     pub fn text(&mut self, text: &str, font: &str, font_size: f32) -> Text {
         self.set_font(font, font_size);
         let mut glyph_positions = (0..text.len()).map(|_| {
@@ -412,6 +492,7 @@ impl NvgContext {
                 glyph_positions,
                 matrics: self.text_matrics.clone(),
                 dirty: true,
+                fit: false,
                 x: 0.0,
                 y: 0.0
             }
@@ -442,7 +523,7 @@ impl NvgContext {
         }
     }
     
-    pub fn image_paint(&mut self, image: Image, shape: Shape, alpha: f32) -> NVGpaint {
+    pub fn image_paint(&mut self, image: &Image, shape: Shape, alpha: f32) -> NVGpaint {
         unsafe {
             let (x, y, w, h) = shape.bounds();
             nvgImagePattern(self.context, x, self.invert_y(y, h), w, h, 0.0, image.id, alpha)
@@ -455,7 +536,7 @@ impl NvgContext {
         }
     }
     
-    pub fn set_fill_paint(&mut self, paint: NVGpaint) {
+    pub fn fill_paint(&mut self, paint: NVGpaint) {
         unsafe {
             nvgFillPaint(self.context, paint);
         }
@@ -470,6 +551,36 @@ impl NvgContext {
     pub fn stroke(&mut self) {
         unsafe {
             nvgStroke(self.context);
+        }
+    }
+
+    pub fn rotate(&mut self, angle: f32) {
+        unsafe {
+            nvgRotate(self.context, angle);
+        }
+    }
+
+    pub fn translate(&mut self, x: f32, y: f32) {
+        unsafe {
+            nvgTranslate(self.context, x, y);
+        }
+    }
+
+    pub fn scale(&mut self, x: f32, y: f32) {
+        unsafe {
+            nvgScale(self.context, x, y);
+        }
+    }
+
+    pub fn save_state(&mut self) {
+        unsafe {
+            nvgSave(self.context);
+        }
+    }
+
+    pub fn restore_state(&mut self) {
+        unsafe {
+            nvgRestore(self.context);
         }
     }
 
@@ -524,9 +635,9 @@ impl NvgContext {
         }
     }
 
-    fn delete_image(&mut self, id: i32) {
+    pub fn delete_image(&mut self, image: Image) {
         unsafe {
-            nvgDeleteImage(self.context, id);
+            nvgDeleteImage(self.context, image.id);
         }
     }
 

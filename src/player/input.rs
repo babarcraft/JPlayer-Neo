@@ -125,7 +125,7 @@ impl PacketQueue {
         let pts = packet.pts();
         if pts != AV_NOPTS_VALUE {
             let pts = self.timebase * (pts as f64);
-            let begin = if self.view.is_initialized() {
+            let begin = if self.view.is_initialized() && set_serial.is_none() {
                 None
             } else { Some(pts) };
             self.view.update(begin, Some(pts), set_serial);
@@ -393,13 +393,12 @@ impl InputWorkerContext {
                 !pair.serial_matches(pair.input.serial)
             ).peekable();
         let empty = available.peek().is_none();
-        self.passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for pair in available {
             match pair.input.read_packet() {
                 Ok(packet) => {
                     if let Some(entry) = &pair.entries[packet.stream_index() as usize] {
                         let mut queue = entry.queue.write().unwrap();
-                        // let last = queue.queued().unwrap_or(0.0);
+                        self.passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         queue.push(packet);
                         entry.consumer_notifier.send(DecodeWorkerMessage::Wakeup).unwrap();
                     }
@@ -438,9 +437,9 @@ impl InputWorkerContext {
                     InputCommand::Seek(min, max, stream) => {
                         match input.seek(min, max, stream) {
                             Err(error) => {
-                                println!("Error seeking: {:?}", error);
+                                eprintln!("Error seeking: {:?}", error);
                             }
-                            _ => eprintln!("Currently not implemented!"),
+                            _ => println!("Seek success"),
                         }
                     },
                     InputCommand::PutQueue(index, queue, sender) => {

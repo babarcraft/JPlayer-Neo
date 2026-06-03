@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::null_mut;
 use cpal::SampleFormat;
-use ffmpeg_sys_next::{av_channel_layout_default, av_get_bytes_per_sample, av_hwdevice_ctx_create, av_sample_fmt_is_planar, avcodec_alloc_context3, avcodec_find_decoder, avcodec_flush_buffers, avcodec_free_context, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_send_packet, swr_alloc, swr_alloc_set_opts2, swr_close, swr_convert, swr_free, swr_get_out_samples, swr_init, AVBufferRef, AVChannelLayout, AVChannelLayout__bindgen_ty_1, AVChannelOrder, AVCodec, AVCodecContext, AVCodecHWConfig, AVHWDeviceType, AVPixelFormat, AVSampleFormat, SwrContext, AVERROR_DECODER_NOT_FOUND, AVERROR_EOF, AVERROR_UNKNOWN};
+use ffmpeg_sys_next::{av_channel_layout_default, av_channel_layout_uninit, av_get_bytes_per_sample, av_hwdevice_ctx_create, av_rescale_rnd, av_sample_fmt_is_planar, avcodec_alloc_context3, avcodec_find_decoder, avcodec_flush_buffers, avcodec_free_context, avcodec_get_hw_config, avcodec_open2, avcodec_parameters_to_context, avcodec_send_packet, swr_alloc, swr_alloc_set_opts2, swr_close, swr_convert, swr_free, swr_get_delay, swr_get_out_samples, swr_init, AVBufferRef, AVChannelLayout, AVChannelLayout__bindgen_ty_1, AVChannelOrder, AVCodec, AVCodecContext, AVCodecHWConfig, AVHWDeviceType, AVPixelFormat, AVRounding, AVSampleFormat, SwrContext, AVERROR, AVERROR_DECODER_NOT_FOUND, AVERROR_EOF, AVERROR_UNKNOWN, ENOMEM};
 use crate::ffmpeg::error::Error;
 use crate::ffmpeg::frame::{AudioFrame, Frame};
 use crate::ffmpeg::input::Stream;
@@ -148,80 +148,127 @@ pub struct AudioConverter {
     is_planar: bool,
     sample_format: AVSampleFormat,
     channel_layout: AVChannelLayout,
+    serial: Option<u32>
 }
 
 unsafe impl Send for AudioConverter {}
-unsafe impl Sync for AudioConverter {}
 
 impl AudioConverter {
-    pub fn new(channels: u32, sample_rate: u32, sample_format: AVSampleFormat) -> AudioConverter {
+    pub fn new(
+        channels: u32,
+        sample_rate: u32,
+        sample_format: AVSampleFormat,
+        src_layout: &AVChannelLayout,
+        src_rate: u32,
+        src_format: AVSampleFormat,
+    ) -> Result<Self, Error> {
         unsafe {
-            let mut channel_layout: AVChannelLayout = AVChannelLayout {
-                order: AVChannelOrder::FF_CHANNEL_ORDER_NB,
-                nb_channels: 0,
-                u: AVChannelLayout__bindgen_ty_1 {
-                    mask: 0
-                },
-                opaque: null_mut()
-            };
-            av_channel_layout_default(&mut channel_layout, channels as i32);
-            AudioConverter {
-                context: swr_alloc(),
-                channels,
-                sample_rate,
-                sample_format,
-                sample_bytes: av_get_bytes_per_sample(sample_format) as u32,
-                is_planar: av_sample_fmt_is_planar(sample_format) == 1,
-                channel_layout
-            }
-        }
-    }
+            let mut dst_layout = std::mem::zeroed::<AVChannelLayout>();
+            av_channel_layout_default(&mut dst_layout, channels as i32);
 
-    pub fn convert_frame(&mut self, frame: &Frame, dest: &mut AudioFrame) -> Result<(), Error> {
-        unsafe {
-            let samples_num = frame.num_samples() as i32;
-            if self.context.is_null() {
-                return Err(Error::from_code(-1));
+            let mut context = swr_alloc();
+
+            if context.is_null() {
+                return Err(Error::from_code(AVERROR(ENOMEM)));
             }
 
             let result = swr_alloc_set_opts2(
-                &mut self.context,
-                &self.channel_layout,
-                self.sample_format,
-                self.sample_rate as i32,
-                &frame.channel_layout(),
-                frame.sample_format().unwrap(),
-                frame.sample_rate() as i32,
+                &mut context,
+                &dst_layout,
+                sample_format,
+                sample_rate as i32,
+                src_layout,
+                src_format,
+                src_rate as i32,
                 0,
-                null_mut()
+                std::ptr::null_mut(),
+            );
+
+            if result < 0 {
+                swr_free(&mut context);
+                return Err(Error::from_code(result));
+            }
+
+            let result = swr_init(context);
+
+            if result < 0 {
+                swr_free(&mut context);
+                return Err(Error::from_code(result));
+            }
+
+            Ok(Self {
+                context,
+                channels,
+                sample_rate,
+                sample_bytes: av_get_bytes_per_sample(sample_format) as u32,
+                is_planar: av_sample_fmt_is_planar(sample_format) != 0,
+                sample_format,
+                channel_layout: dst_layout,
+                serial: None
+            })
+        }
+    }
+
+    pub fn convert_frame(
+        &mut self,
+        frame: &Frame,
+        dest: &mut AudioFrame,
+    ) -> Result<(), Error> {
+        if self.serial != frame.serial {
+            self.flush(dest)?;
+            self.serial = frame.serial;
+        }
+        unsafe {
+            let in_samples = frame.num_samples() as i32;
+
+            let delay = swr_get_delay(
+                self.context,
+                frame.sample_rate() as i64,
+            );
+
+            let max_out_samples = av_rescale_rnd(
+                delay + in_samples as i64,
+                self.sample_rate as i64,
+                frame.sample_rate() as i64,
+                AVRounding::AV_ROUND_UP,
+            ) as i32;
+
+            let planes = if self.is_planar {
+                self.channels as usize
+            } else {
+                1
+            };
+
+            let bytes_per_plane = if self.is_planar {
+                max_out_samples as usize * self.sample_bytes as usize
+            } else {
+                max_out_samples as usize
+                    * self.sample_bytes as usize
+                    * self.channels as usize
+            };
+
+            dest.ensure_allocated(bytes_per_plane, planes);
+
+            let src = (*frame.pointer).data.as_ptr() as *const *const u8;
+
+            let result = swr_convert(
+                self.context,
+                dest.planes.as_mut_ptr(),
+                max_out_samples,
+                src,
+                in_samples,
             );
 
             if result < 0 {
                 return Err(Error::from_code(result));
             }
 
-            let result = swr_init(self.context);
-            if result < 0 {
-                return Err(Error::from_code(result));
-            }
-
-            let samples_out = swr_get_out_samples(self.context, samples_num);
-            let planes = if self.is_planar { self.channels } else { 1 };
-            let buffer_size = if self.is_planar {
-                samples_out as u32 * self.sample_bytes
-            } else {
-                samples_out as u32 * self.sample_bytes * self.channels
-            };
-            dest.ensure_allocated(buffer_size as usize, planes as usize);
-            let src = (*frame.pointer).data.as_ptr() as *const *const u8;
-            let dest_ptr = dest.planes.as_ptr();
-            let result = swr_convert(self.context, dest_ptr, samples_out, src, samples_num);
-            if result < 0 {
-                return Err(Error::from_code(result))
-            }
             dest.channels = self.channels as usize;
             dest.sample_rate = self.sample_rate;
-            dest.num_samples = if self.is_planar { self.channels as usize } else { 1 } * result as usize;
+
+            // samples PER CHANNEL
+            dest.num_samples = result as usize;
+
             dest.pts = frame.pts;
             dest.duration = frame.duration;
             dest.serial = frame.serial;
@@ -229,14 +276,58 @@ impl AudioConverter {
             Ok(())
         }
     }
+
+    pub fn flush(
+        &mut self,
+        dest: &mut AudioFrame,
+    ) -> Result<usize, Error> {
+        unsafe {
+            let max_out_samples = swr_get_out_samples(self.context, 0);
+
+            if max_out_samples <= 0 {
+                return Ok(0);
+            }
+
+            let planes = if self.is_planar {
+                self.channels as usize
+            } else {
+                1
+            };
+
+            let bytes_per_plane = if self.is_planar {
+                max_out_samples as usize * self.sample_bytes as usize
+            } else {
+                max_out_samples as usize
+                    * self.sample_bytes as usize
+                    * self.channels as usize
+            };
+
+            dest.ensure_allocated(bytes_per_plane, planes);
+
+            let result = swr_convert(
+                self.context,
+                dest.planes.as_mut_ptr(),
+                max_out_samples,
+                std::ptr::null(),
+                0,
+            );
+
+            if result < 0 {
+                return Err(Error::from_code(result));
+            }
+
+            dest.num_samples = result as usize;
+
+            Ok(result as usize)
+        }
+    }
 }
 
 impl Drop for AudioConverter {
     fn drop(&mut self) {
         unsafe {
-            if !self.context.is_null() {
-                swr_free(&mut self.context);
-            }
+            swr_free(&mut self.context);
+            av_channel_layout_uninit(&mut self.channel_layout);
         }
     }
 }

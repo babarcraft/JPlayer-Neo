@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use crate::ffmpeg::frame::Frame;
@@ -6,6 +8,8 @@ use crate::gs::fence::Fence;
 use crate::gs::gl::mapped_buffer_barrier;
 use crate::gs::shader::Shader;
 use crate::gs::texture::{InternalFormat, Texture};
+use crate::player::clock::AtomicF64;
+use crate::player::player::VideoPlayback;
 
 pub struct FrameQueue {
     frames: Vec<Frame>,
@@ -16,6 +20,8 @@ pub struct FrameQueue {
 
 #[derive(Clone)]
 pub struct FrameQueueView {
+    seek: Arc<AtomicF64>,
+    seek_avoid_serial: Arc<AtomicU32>,
     size: Arc<AtomicUsize>,
     serial: Arc<AtomicU32>,
     closed: Arc<AtomicBool>,
@@ -43,6 +49,32 @@ impl FrameQueueView {
     pub fn closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
+    
+    pub fn set_seek(&self, seek: f64) {
+        self.seek.store(seek, Ordering::SeqCst);
+        self.seek_avoid_serial.store(self.serial(), Ordering::SeqCst);
+    }
+    
+    pub fn has_seek(&self) -> bool {
+        self.seek.load(Ordering::SeqCst) > 0.0
+    }
+    
+    pub fn check_seek_and_clear(&self, frame: &Frame) -> bool {
+        let seek = self.seek.load(Ordering::SeqCst);
+        if seek <= 0f64 {
+            return false;
+        }
+        let avoid = self.seek_avoid_serial.load(Ordering::SeqCst);
+        if Some(avoid) == frame.serial {
+            true
+        } else if seek > frame.pts.unwrap_or(0.0) + frame.duration.unwrap_or(0.0) {
+            true
+        } else {
+            self.seek.store(-1.0, Ordering::SeqCst);
+            self.seek_avoid_serial.store(0, Ordering::SeqCst);
+            false
+        }
+    }
 }
 
 impl FrameQueue {
@@ -50,6 +82,8 @@ impl FrameQueue {
         Self {
             frames: (0..capacity).map(|_| Frame::new()).collect(),
             view: FrameQueueView {
+                seek_avoid_serial: Arc::new(AtomicU32::new(0)),
+                seek: Arc::new(AtomicF64::new(-1.0)),
                 size: Arc::new(AtomicUsize::new(0)),
                 serial: Arc::new(AtomicU32::new(0)),
                 closed: Arc::new(AtomicBool::new(false)),
@@ -105,6 +139,19 @@ impl FrameQueue {
     }
 
     pub fn push(&mut self) {
+        let seek = self.view.seek.load(Ordering::SeqCst);
+        if seek > 0.0 {
+            let avoid = self.view.seek_avoid_serial.load(Ordering::SeqCst);
+            let frame = &self.frames[self.write_index];
+            let out = frame.pts.unwrap_or(0.0) + frame.duration.unwrap_or(0.0);
+            if frame.serial == Some(avoid) || out < seek {
+                self.clear();
+                return;
+            } else {
+                self.view.seek_avoid_serial.store(0, Ordering::SeqCst);
+                self.view.seek.store(-1.0, Ordering::SeqCst);
+            }
+        }
         let frame = &self.frames[self.write_index];
         if let Some(frame_serial) = frame.serial {
             self.check_and_update_serial(frame_serial);
@@ -216,9 +263,12 @@ pub struct VideoSurface {
     write_index: u8,
     read_index: u8,
     upload_textures: [Texture; 3],
-    pub output_texture: Texture,
     compute_shader: Option<Shader>,
     shader_planes: usize,
+
+    playback: Option<Rc<RefCell<VideoPlayback>>>,
+
+    pub output_texture: Texture,
     pub size_update: Option<(f32, f32)>
 }
 
@@ -236,6 +286,7 @@ impl VideoSurface {
                 Texture::new(),
             ],
             output_texture: Texture::new(),
+            playback: None,
             size_update: None,
             compute_shader: None,
             shader_planes: 0,
@@ -245,7 +296,7 @@ impl VideoSurface {
         }
     }
 
-    pub fn ensure_compute_shader(&mut self) {
+    fn ensure_compute_shader(&mut self) {
         let slot = &self.upload_slots[self.read_index as usize];
         let planes = match slot.uploaded_planes {
             Some(planes) => planes,
@@ -263,7 +314,7 @@ impl VideoSurface {
         }
     }
 
-    pub fn ensure_texture_size(&mut self) {
+    fn ensure_texture_size(&mut self) {
         let slot = &self.upload_slots[self.read_index as usize];
         let planes = match slot.uploaded_planes {
             Some(planes) => planes,
@@ -303,6 +354,21 @@ impl VideoSurface {
         self.size < self.upload_slots.len() as u8
     }
 
+    pub fn update(&mut self) {
+        if let Some(playback) = self.playback.take() {
+            let mut ref_mut = playback.borrow_mut();
+            ref_mut.update(self);
+            let closed = ref_mut.closed;
+            drop(ref_mut);
+
+            if !closed {
+                self.playback = Some(playback);
+            }
+
+            self.convert_output();
+        }
+    }
+
     pub fn upload(&mut self, frame: &Frame, plane_formats: &[InternalFormat], chroma: Option<usize>) {
         if !self.can_upload() {
             return;
@@ -311,8 +377,6 @@ impl VideoSurface {
         {
             let slot = &mut self.upload_slots[self.write_index as usize];
             slot.upload(frame, plane_formats, chroma);
-            self.ensure_compute_shader();
-            self.ensure_texture_size();
         }
 
 
@@ -325,17 +389,24 @@ impl VideoSurface {
             return;
         }
 
+        self.ensure_compute_shader();
+        self.ensure_texture_size();
+        
         let shader = match &self.compute_shader {
             Some(shader) => shader,
             None => return
         };
 
-        let slot = &mut self.upload_slots[self.read_index as usize];
+        {
+            let slot = &mut self.upload_slots[self.read_index as usize];
 
-        if !slot.fence.check_done(None) {
-            return;
+            if !slot.fence.check_done(None) {
+                return;
+            }
         }
 
+
+        let slot = &mut self.upload_slots[self.read_index as usize];
         shader.bind();
         let desc = slot.uploaded_planes_dimensions[0];
         slot.upload_to_textures_bind(&self.upload_textures);
@@ -347,5 +418,9 @@ impl VideoSurface {
 
         self.read_index = (self.read_index + 1) % self.upload_slots.len() as u8;
         self.size -= 1;
+    }
+
+    pub fn set_playback(&mut self, playback: Rc<RefCell<VideoPlayback>>) {
+        self.playback = Some(playback);
     }
 }
