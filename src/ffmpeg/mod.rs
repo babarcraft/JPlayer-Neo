@@ -1,5 +1,5 @@
 use std::ffi::c_void;
-use ffmpeg_sys_next::{av_gettime_relative, av_malloc};
+use ffmpeg_sys_next::{av_free, av_gettime_relative, av_malloc};
 
 pub mod input;
 pub mod format;
@@ -13,4 +13,9 @@ pub fn current_time() -> u64 {
     unsafe {
         av_gettime_relative().max(0) as u64
     }
+}
+
+pub struct Buffer {
+    ptr: *mut u8,
+    size: usize,
 }

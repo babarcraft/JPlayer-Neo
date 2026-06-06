@@ -17,7 +17,7 @@ use reqwest::Response;
 use crate::ffmpeg;
 use crate::ffmpeg::error::Error;
 use crate::ffmpeg::input::{Input, Stream};
-use crate::ffmpeg::packet::Packet;
+use crate::ffmpeg::packet::{ByteBuffer, Packet};
 use crate::gs::texture::Texture;
 use crate::player::decoder::DecodeWorkerMessage;
 
@@ -238,6 +238,7 @@ struct InputWorkerContext {
     receiver: Receiver<InputWorkerMessage>,
     inputs: Vec<InputReadJob>,
     passes: Arc<AtomicUsize>,
+    buffer: ByteBuffer,
     http_client: Option<reqwest::blocking::Client>,
     close: bool,
 }
@@ -393,17 +394,19 @@ impl InputWorkerContext {
                 !pair.serial_matches(pair.input.serial)
             ).peekable();
         let empty = available.peek().is_none();
+        let mut buffer = &mut self.buffer;
         for pair in available {
             match pair.input.read_packet() {
                 Ok(packet) => {
                     if let Some(entry) = &pair.entries[packet.stream_index() as usize] {
                         let mut queue = entry.queue.write().unwrap();
-                        self.passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.passes.fetch_add(1, Ordering::Relaxed);
                         queue.push(packet);
                         entry.consumer_notifier.send(DecodeWorkerMessage::Wakeup).unwrap();
                     }
                 },
                 Err(error) => {
+                    pair.input.flush();
                     eprintln!("Read error: {:?}", error);
                 }
             }
@@ -432,15 +435,11 @@ impl InputWorkerContext {
     fn handle_input_commands(&mut self) {
         for job in self.inputs.iter_mut() {
             let input = &mut job.input;
+            let mut seek = None;
             while let Some(command) = job.receiver.try_recv().ok() {
                 match command {
                     InputCommand::Seek(min, max, stream) => {
-                        match input.seek(min, max, stream) {
-                            Err(error) => {
-                                eprintln!("Error seeking: {:?}", error);
-                            }
-                            _ => println!("Seek success"),
-                        }
+                        seek = Some((min, max, stream));
                     },
                     InputCommand::PutQueue(index, queue, sender) => {
                         let queue_view = queue.read().unwrap().view();
@@ -453,6 +452,14 @@ impl InputWorkerContext {
                     InputCommand::Begin => {
                         job.begin = true;
                     }
+                }
+            }
+            if let Some((min, max, stream)) = seek {
+                match input.seek(min, max, stream) {
+                    Err(error) => {
+                        eprintln!("Error seeking: {:?}", error);
+                    }
+                    _ => {},
                 }
             }
         }
@@ -497,6 +504,7 @@ impl InputWorker {
             inputs: vec![],
             close: false,
             http_client: None,
+            buffer: ByteBuffer::new(1024),
             passes: passes.clone(),
         };
         let thread = Some(std::thread::spawn(move || {

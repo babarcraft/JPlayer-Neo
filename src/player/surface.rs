@@ -257,6 +257,7 @@ impl UploadSlot {
     }
 }
 
+
 pub struct VideoSurface {
     upload_slots: [UploadSlot; 3],
     size: u8,

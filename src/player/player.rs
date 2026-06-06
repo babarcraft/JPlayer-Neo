@@ -3,7 +3,8 @@ use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::sync::mpsc::Sender;
 use std::time::Instant;
-use crate::ffmpeg::input::{Input, Stream, StreamType};
+use mlua::{UserData, UserDataMethods};
+use crate::ffmpeg::input::{Input, InterruptContext, Stream, StreamType};
 use crate::gs::texture::InternalFormat;
 use crate::player::audio::AudioDevice;
 use crate::player::clock::Clock;
@@ -173,6 +174,8 @@ pub struct VideoPlayer {
     pub master_clock: Box<dyn Clock>,
     pub estimated_duration: f64,
 
+    input_interrupt: InterruptContext,
+
     input_job_handle: InputJobHandle,
     input_worker_sender: Sender<InputWorkerMessage>,
     decode_worker_sender: Sender<DecodeWorkerMessage>,
@@ -195,6 +198,7 @@ impl VideoPlayer {
 
         let estimated_duration = input.duration();
 
+        let input_interrupt = input.interrupt_context.as_ref().clone();
         let handle = input_worker.add_input(input);
 
         let audio_device = if let Some(audio_stream) = &audio_stream {
@@ -226,6 +230,7 @@ impl VideoPlayer {
             audio_device,
             video_stream,
             audio_stream,
+            input_interrupt,
             master_clock: master_clock.unwrap(),
             input_job_handle: handle,
             input_worker_sender: input_worker.get_sender(),
@@ -259,6 +264,7 @@ impl VideoPlayer {
             let playback = playback.borrow_mut();
             playback.frame_queue_view.set_seek(target);
         }
+        self.input_interrupt.interrupt();
         self.decode_worker_sender.send(DecodeWorkerMessage::Wakeup).unwrap();
         self.input_worker_sender.send(InputWorkerMessage::Update).unwrap();
     }
@@ -288,4 +294,15 @@ impl Drop for VideoPlayer {
             playback.borrow_mut().closed = true;
         }
     }
+}
+
+impl UserData for VideoPlayer {
+
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut("play", |_, this, _args: ()| {
+            this.play();
+            Ok(())
+        });
+    }
+
 }

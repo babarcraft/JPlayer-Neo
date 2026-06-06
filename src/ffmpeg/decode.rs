@@ -110,15 +110,16 @@ impl Decoder {
         frame.receive_frame_from_decoder(self.serial, self.timebase, self.context)
     }
 
+    pub fn flush(&mut self) {
+        unsafe {
+            avcodec_flush_buffers(self.context);
+        }
+    }
+
     pub fn send_packet(&mut self, packet: &Packet) -> Result<(), Error> {
         unsafe {
-            if let Some(serial) = self.serial {
-                if serial != packet.serial {
-                    avcodec_flush_buffers(self.context);
-                    self.serial = Some(packet.serial);
-                }
-            } else {
-                avcodec_flush_buffers(self.context);
+            if Some(packet.serial) != self.serial {
+                self.flush();
                 self.serial = Some(packet.serial);
             }
 

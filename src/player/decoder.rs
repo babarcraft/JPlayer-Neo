@@ -443,13 +443,22 @@ impl DecodeWorkerContext {
                     job.write_received();
                 }
                 DecoderResult::NeedsInput => {
+                    if job.packet_queue_view.queued().unwrap_or(0.0) < 5.0 {
+                        job.input_handle.notify_worker();
+                    }
                     if let Some(packet) = job.packet_queue.write().unwrap().pop() {
-                        job.decoder.send_packet(&packet).unwrap();
-                        job.needs_input = false;
+                        match job.decoder.send_packet(&packet) {
+                            Err(e) => {
+                                job.decoder.flush();
+                            }
+                            Ok(_) => {
+                                job.needs_input = false;
+                            }
+                        }
                     } else {
                         job.needs_input = true;
+                        job.input_handle.notify_worker();
                     }
-                    job.input_handle.notify_worker();
                 }
             }
         }

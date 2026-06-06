@@ -1,6 +1,6 @@
 use crate::ffmpeg;
 use crate::ffmpeg::error::Error;
-use ffmpeg_sys_next::{av_dict_set, av_dump_format, av_q2d, av_read_frame, av_seek_frame, avcodec_parameters_alloc, avcodec_parameters_copy, avcodec_parameters_free, avformat_find_stream_info, avformat_flush, avformat_seek_file, avio_seek, AVCodecParameters, AVMediaType, AVRational, AVStream, AVERROR_EOF, AVSEEK_FLAG_BACKWARD, AV_TIME_BASE, SEEK_SET};
+use ffmpeg_sys_next::{av_dict_set, av_dump_format, av_q2d, av_read_frame, av_seek_frame, avcodec_parameters_alloc, avcodec_parameters_copy, avcodec_parameters_free, avformat_find_stream_info, avformat_flush, avformat_seek_file, avio_seek, AVCodecParameters, AVIOInterruptCB, AVMediaType, AVRational, AVStream, AVERROR_EOF, AVSEEK_FLAG_BACKWARD, AV_TIME_BASE, SEEK_SET};
 use ffmpeg_sys_next::avformat_alloc_context;
 use ffmpeg_sys_next::avformat_close_input;
 use ffmpeg_sys_next::avformat_open_input;
@@ -8,12 +8,15 @@ use ffmpeg_sys_next::AVDictionary;
 use ffmpeg_sys_next::AVFormatContext;
 use ffmpeg_sys_next::AVPacket;
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{c_int, c_void, CString};
 use std::ptr::null;
 use std::str::FromStr;
-use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::SystemTime;
 use crate::ffmpeg::packet::Packet;
 use crate::ffmpeg::utils::{convert_options, convert_options_iter};
+use crate::player::clock::{AtomicF64, AtomicInstant};
 
 static INPUT_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -92,8 +95,41 @@ impl Clone for Stream {
     }
 }
 
+unsafe extern "C" fn interrupt_callback(context: *mut c_void) -> c_int {
+    unsafe {
+        let context = context as *const InterruptContext;
+        let interrupt = &(*context).interrupt;
+        if interrupt.load(Ordering::SeqCst) {
+            interrupt.store(false, Ordering::SeqCst);
+            1
+        } else {
+            0
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct InterruptContext {
+    interrupt: Arc<AtomicBool>,
+    // timeout_secs: Arc<AtomicF64>,
+    // timeout_begin: Arc<AtomicInstant>
+}
+
+impl InterruptContext {
+    pub fn new() -> Box<InterruptContext> {
+        Box::new(InterruptContext {
+            interrupt: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    pub fn interrupt(&self) {
+        self.interrupt.store(true, Ordering::SeqCst);
+    }
+}
+
 pub struct Input {
     context: *mut AVFormatContext,
+    pub interrupt_context: Box<InterruptContext>,
     pub options: Vec<(String, String)>,
     pub path: String,
 
@@ -118,6 +154,11 @@ impl Input {
     pub fn open(path: &str, options: &[(&str, &str)]) -> Result<Self, Error> {
         unsafe {
             let mut context = avformat_alloc_context();
+            let mut interrupt_context = InterruptContext::new();
+            (*context).interrupt_callback = AVIOInterruptCB {
+                callback: Some(interrupt_callback),
+                opaque: interrupt_context.as_mut() as *mut _ as *mut c_void,
+            };
             let path_str = CString::from_str(path).unwrap();
             let result = avformat_open_input(
                 &mut context as *mut *mut AVFormatContext,
@@ -142,6 +183,7 @@ impl Input {
             Ok(Input {
                 context,
                 serial: 0,
+                interrupt_context,
                 options: options.iter().map(|&(k, v)| (k.to_string(), v.to_string())).collect(),
                 path: path.to_string(),
                 id: INPUT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),

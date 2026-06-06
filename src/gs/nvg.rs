@@ -4,9 +4,11 @@ use std::fs::File;
 use std::io::Read;
 use std::ops::Range;
 use std::os::raw::c_char;
+use std::process::Command;
 use std::ptr::{null, null_mut};
 use std::str::FromStr;
-use nanovg_sys::{nvgBeginFrame, nvgBeginPath, nvgCircle, nvgCreateFont, nvgCreateGL3, nvgCreateImage, nvgCreateImageRGBA, nvgDeleteImage, nvgEndFrame, nvgFill, nvgFillColor, nvgFillPaint, nvgFontFace, nvgFontSize, nvgImagePattern, nvgIntersectScissor, nvgLineTo, nvgMoveTo, nvgRect, nvgRestore, nvgRotate, nvgSave, nvgScale, nvgScissor, nvgStroke, nvgStrokeColor, nvgStrokeWidth, nvgText, nvgTextGlyphPositions, nvgTextMetrics, nvgTranslate, nvglCreateImageFromHandleGL3, NVGcolor, NVGglyphPosition, NVGpaint};
+use mlua::UserData;
+use nanovg_sys::{nvgBeginFrame, nvgBeginPath, nvgCircle, nvgCreateFont, nvgCreateGL3, nvgCreateImage, nvgCreateImageRGBA, nvgDeleteImage, nvgEndFrame, nvgFill, nvgFillColor, nvgFillPaint, nvgFontFace, nvgFontSize, nvgImagePattern, nvgImageSize, nvgIntersectScissor, nvgLineTo, nvgMoveTo, nvgRect, nvgRestore, nvgRotate, nvgSave, nvgScale, nvgScissor, nvgStroke, nvgStrokeColor, nvgStrokeWidth, nvgText, nvgTextGlyphPositions, nvgTextMetrics, nvgTranslate, nvglCreateImageFromHandleGL3, NVGcolor, NVGglyphPosition, NVGpaint};
 use crate::gs::texture::Texture;
 
 pub struct NvgContext {
@@ -98,6 +100,21 @@ impl Shape {
             Shape::Circle(x0, y0, r) => {
                 Shape::Circle(x0 + ox, y0 + oy, r * 2.0)
             }
+        }
+    }
+    
+    pub fn scale_xy(&self, sx: f32, sy: f32, centered: bool) -> Shape {
+        match *self {
+            Shape::Rect(x, y, w, h) => {
+                if centered {
+                    let ox = (1.0 - sx) * w * 0.5;
+                    let oy = (1.0 - sy) * h * 0.5;
+                    Shape::Rect(x + ox, y + oy, w * sx, h * sy)
+                } else {
+                    Shape::Rect(x, y, w * sx, h * sy)
+                }
+            }
+            _ => unimplemented!(),
         }
     }
 
@@ -302,6 +319,7 @@ impl Text {
 
 }
 
+#[derive(Debug)]
 pub struct Image {
     id: c_int,
     pub width: u32,
@@ -319,12 +337,20 @@ impl Image {
 
 }
 
+impl UserData for Image {}
+
 pub fn string_to_ptr_end(string: &str) -> (*const c_char, *const c_char) {
     unsafe {
         let ptr = string.as_ptr() as *const c_char;
         let end = ptr.add(string.len());
         (ptr, end)
     }
+}
+
+pub enum DrawCommand<'a> {
+    TextBox(Shape, &'a Text, Color, TextHorizontalAlignment, TextVerticalAlignment),
+    ShapeColor(Shape, Color),
+    ShapeImage(Shape, &'a Image),
 }
 
 impl NvgContext {
@@ -510,16 +536,16 @@ impl NvgContext {
         }
     }
     
-    pub fn create_texture_image(&mut self, texture: &Texture) -> Image {
+    pub fn create_texture_image(&mut self, texture: &Texture) -> Option<Image> {
         unsafe {
             let image = nvglCreateImageFromHandleGL3(
                 self.context,
                 texture.id,
-                texture.width.unwrap() as i32,
-                texture.height.unwrap() as i32,
+                texture.width? as i32,
+                texture.height? as i32,
                 nanovg_sys::NVGimageFlagsGL::NVG_IMAGE_NODELETE.bits()
             );
-            Image { id: image, width: texture.width.unwrap(), height: texture.height.unwrap() }
+            Some(Image { id: image, width: texture.width?, height: texture.height? })
         }
     }
     
@@ -627,11 +653,16 @@ impl NvgContext {
         }
     }
 
-    pub fn create_image(&mut self, path: &str) -> Option<i32> {
+    pub fn create_image(&mut self, path: &str) -> Option<Image> {
         unsafe {
             let path = CString::new(path).unwrap();
-            Some(nvgCreateImage(self.context, path.as_ptr(), 0))
-                .take_if(|id| *id >= 0)
+            let mut width = 0;
+            let mut height = 0;
+            let image = nvgCreateImage(self.context, path.as_ptr(), 0);
+            nvgImageSize(self.context, image, &mut width, &mut height);
+            Some(image).take_if(|id| *id >= 0).map(|id| Image {
+                id, width: width as u32, height: height as u32
+            })
         }
     }
 
@@ -660,5 +691,29 @@ impl NvgContext {
     
     pub fn relative(&self, px: f32, py: f32) -> (f32, f32) {
         (self.width(Some(px)), self.height(Some(py)))
+    }
+    
+    pub fn handle_command(&mut self, command: DrawCommand) {
+        match command {
+            DrawCommand::ShapeColor(shape, color) => {
+                self.begin_path();
+                self.draw_shape(shape);
+                self.fill_color(color);
+                self.fill();
+            }
+            DrawCommand::ShapeImage(shape, image) => {
+                self.begin_path();
+                self.draw_shape(shape);
+                let paint = self.image_paint(&image, shape, 1.0);
+                self.fill_paint(paint);
+                self.fill();
+            }
+            DrawCommand::TextBox(shape, text, color, horiz, vert) => {
+                self.begin_path();
+                self.fill_color(color);
+                self.draw_text_inside(text, shape, horiz, vert);
+                self.fill();
+            }
+        }
     }
 }
