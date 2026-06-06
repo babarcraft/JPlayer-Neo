@@ -18,29 +18,19 @@ use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
 struct App {
-    input_worker: InputWorker,
-    decode_worker: DecodeWorker,
-    nvg_context: NvgContext,
     ui: UIManager
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(window: &Window) -> Self {
         let mut nvg_context = NvgContext::new();
 
         nvg_context.load_font("default", "src/res/def.ttf");
 
-        let mut input_worker = InputWorker::new();
-        let mut decode_worker = DecodeWorker::new();
-
-
-        let mut ui = UIManager::new();
-        ui.exec(std::fs::read_to_string("ui.lua").unwrap());
+        let mut ui = UIManager::new(Rc::new(RefCell::new(nvg_context)), window);
+        ui.load_script(std::fs::read_to_string("ui.lua").unwrap()).unwrap();
 
         Self {
-            input_worker,
-            decode_worker,
-            nvg_context,
             ui
         }
     }
@@ -52,29 +42,18 @@ impl WindowHandler for App {
     fn render(&mut self, dt: f32, window: &mut Window) {
         clear_current_buffer_color();
 
-        let (w, h) = window.get_size();
-
-        self.nvg_context.frame((w, h), |context| {
-            self.ui.update(context).unwrap();
-            self.ui.run_updates().unwrap();
-            self.ui.render(context);
-        });
+        let (w, h) = window.get_framebuffer_size();
+        self.ui.render(w, h).unwrap();
     }
 
     fn handle_event(&mut self, event: WindowEvent, window: &Window) {
-        match event.clone() {
-            WindowEvent::FramebufferSize(..) => {
-                self.ui.dirty();
-            }
-            _ => {}
-        }
+        self.ui.handle_event(event).unwrap();
     }
 }
 
 fn main() {
     let mut window = Window::new("Test", 1000, 1000).unwrap();
-
-    let mut app = App::new();
+    let mut app = App::new(&window);
 
     window.run(&mut app);
 }

@@ -6,8 +6,8 @@ use crate::player::input::InputWorker;
 use crate::player::surface::VideoSurface;
 use glfw::{Action, Key, MouseButton, WindowEvent};
 use mlua::prelude::LuaTable;
-use mlua::{AnyUserData, AsChunk, Function, Lua, Table, UserData, UserDataMethods, Value};
-use std::cell::RefCell;
+use mlua::{AnyUserData, AsChunk, FromLua, Function, IntoLua, Lua, Table, UserData, UserDataMethods, Value};
+use std::cell::{Ref, RefCell};
 use std::rc::Rc;
 use json::value;
 use crate::ffmpeg::input::Input;
@@ -485,7 +485,7 @@ impl ComponentManager {
                 }
             }
             WindowEvent::CursorPos(x, y) => {
-                let y = window.get_size().1 as f64 - y;
+                let y = window.get_framebuffer_size().1 as f64 - y;
                 let (lx, ly) = self.mouse_pos;
                 self.mouse_pos = (x as f32, y as f32);
                 if let Some(child) = self.intersecting_child(x as f32, y as f32, None)
@@ -506,10 +506,9 @@ impl ComponentManager {
     }
 }
 
+#[derive(Copy, Clone)]
 pub enum RenderCommand {
-    VideoSurfaceDraw(Shape, AnyUserData, Option<Image>),
     ShapeColor(Shape, Color),
-    TextBox(Text, Color, Shape, TextHorizontalAlignment, TextVerticalAlignment),
 }
 
 impl UserData for VideoSurface {}
@@ -525,297 +524,216 @@ impl UserData for Text {
     }
 }
 
+struct UIRenderContext {
+    list: Vec<RenderCommand>,
+    nvg: Rc<RefCell<NvgContext>>
+}
+
+impl UIRenderContext {
+    fn new(nvg: Rc<RefCell<NvgContext>>) -> Self {
+        Self { list: Vec::new(), nvg }
+    }
+}
+
+impl TryFrom<Table> for Color {
+    type Error = mlua::Error;
+
+    fn try_from(value: Table) -> Result<Self, Self::Error> {
+        let r = value.get::<f32>(1)?;
+        let g = value.get::<f32>(2)?;
+        let b = value.get::<f32>(3)?;
+        let a = value.get::<f32>(4)?;
+        Ok(Color::rgba(r, g, b, a))
+    }
+}
+
+impl TryFrom<Table> for Shape {
+    type Error = mlua::Error;
+
+    fn try_from(value: Table) -> Result<Self, Self::Error> {
+        let type_ = value.get::<String>(1)?;
+        match type_.as_str() {
+            "rect" => {
+                let x = value.get::<f32>(2)?;
+                let y = value.get::<f32>(3)?;
+                let width = value.get::<f32>(4)?;
+                let height = value.get::<f32>(5)?;
+                Ok(Shape::Rect(x, y, width, height))
+            }
+            _ => Err(Self::Error::RuntimeError(format!("Unknown shape: {}", type_))),
+        }
+    }
+}
+
+impl TryFrom<Table> for RenderCommand {
+    type Error = mlua::Error;
+
+    fn try_from(value: Table) -> Result<Self, Self::Error> {
+        let type_ = value.get::<String>(1)?;
+        match type_.as_str() {
+            "shapeColor" => {
+                let shape: Shape = value.get::<Table>("shape")?.try_into()?;
+                let color: Color = value.get::<Table>("color")?.try_into()?;
+                Ok(RenderCommand::ShapeColor(shape, color))
+            }
+            _ => Err(Self::Error::RuntimeError(format!("Unknown shape: {}", type_))),
+        }
+    }
+}
+
+impl UserData for UIRenderContext {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut("push", |_, this, (table): (Table)| {
+            let command: RenderCommand = table.try_into()?;
+            this.list.push(command);
+            Ok(())
+        });
+        methods.add_method("size", |lua, this, ()| {
+            let table = lua.create_table()?;
+            let (w, h) = this.nvg.borrow().relative(1.0, 1.0);
+            table.set("w", w)?;
+            table.set("h", h)?;
+            Ok(table)
+        });
+        methods.add_method_mut("newText", |_, this, (text, font, size): (String, String, f32)| {
+            let text = this.nvg.borrow_mut().text(text.as_str(), &font, size);
+            Ok(text)
+        });
+        methods.add_method_mut("newVideoSurface", |_, this, (): ()| {
+            Ok(VideoSurface::new())
+        });
+    }
+}
+
+impl IntoLua for InputEvent {
+    fn into_lua(self, lua: &Lua) -> mlua::Result<Value> {
+        let table = lua.create_table()?;
+        match self {
+            InputEvent::Key(key, action) => {
+                table.set(1, "key")?;
+                table.set(2, key as i32)?;
+                table.set(3, action as i32)?;
+            }
+            InputEvent::MouseMoved((x0, y0), (x, y)) => {
+                table.set(1, "mouseMove")?;
+                table.set(2, x0 as i32)?;
+                table.set(3, y0 as i32)?;
+                table.set(4, x as i32)?;
+                table.set(5, y as i32)?;
+            }
+            InputEvent::MouseButton(button, action, (x0, y0)) => {
+                table.set(1, "mouseButton")?;
+                table.set(2, button as i32)?;
+                table.set(3, action as i32)?;
+                table.set(4, x0 as i32)?;
+                table.set(5, y0 as i32)?;
+            }
+        }
+        Ok(Value::Table(table))
+    }
+}
+
 pub struct UIManager {
-    commands: Vec<RenderCommand>,
     lua: Lua,
-    root: Option<LuaTable>,
-    update_functions: Vec<(Table, Function)>,
-    bodies: Vec<(Shape, Table)>,
+    window_size: (f32, f32),
+    mouse_position: (f32, f32),
+    render_function: Option<Function>,
+    update_function: Option<Function>,
+    event_function: Option<Function>,
 }
 
 impl UIManager {
-    pub fn new() -> Self {
+    pub fn new(nvg: Rc<RefCell<NvgContext>>, window: &Window) -> Self {
         let lua = Lua::new();
         let globals = lua.globals();
-        globals.set("inputWorker", InputWorker::new()).unwrap();
-        globals.set("decodeWorker", DecodeWorker::new()).unwrap();
-        globals.set("createPlayer", lua.create_function(|lua, (path, surface): (Value, Value)| {
-            let path = path.as_string().unwrap().to_string_lossy();
-            let input_worker: AnyUserData = lua.globals().get("inputWorker").unwrap();
-            let decode_worker: AnyUserData = lua.globals().get("decodeWorker").unwrap();
-            let input = Input::open(&path, &[]).unwrap();
-            let mut surface = surface.as_userdata().unwrap().borrow_mut::<VideoSurface>().unwrap();
-            let player = VideoPlayer::new(
-                input,
-                Some(&mut *surface),
-                &mut *decode_worker.borrow_mut().unwrap(),
-                &mut *input_worker.borrow_mut().unwrap()
-            ).unwrap();
-            Ok(player)
-        }).unwrap()).unwrap();
+        globals.set("ui", UIRenderContext::new(nvg)).unwrap();
+        globals.set("dirty", true).unwrap();
+        let (w, h) = window.get_framebuffer_size();
         Self {
-            commands: Vec::new(),
             lua,
-            root: None,
-            update_functions: Vec::new(),
-            bodies: Vec::new(),
+            render_function: None,
+            update_function: None,
+            event_function: None,
+            window_size: (w as f32, h as f32),
+            mouse_position: (0.0, 0.0),
         }
     }
 
-    pub fn exec(&mut self, chunk: impl AsChunk) {
-        self.lua.load(chunk).exec().unwrap();
-        self.dirty();
+    pub fn load_script(&mut self, chunk: impl AsChunk) -> Result<(), mlua::Error> {
+        let table: Table = self.lua.load(chunk).eval()?;
+        self.render_function = Some(table.get("render")?);
+        self.update_function = Some(table.get("update")?);
+        self.event_function = Some(table.get("event")?);
+        Ok(())
     }
 
     pub fn lua(&self) -> &Lua {
         &self.lua
     }
 
-    pub fn run_updates(&mut self) -> Result<(), mlua::Error> {
-        for (parent, function) in self.update_functions.iter() {
-            function.call::<()>(parent)?;
-        }
-        Ok(())
-    }
-
-    pub fn update(&mut self, nvg: &mut NvgContext) -> Result<(), mlua::Error> {
+    pub fn render(&self, width: f32, height: f32) -> Result<(), mlua::Error> {
         let globals = self.lua.globals();
-        if !globals.get::<Value>("dirty")?.as_boolean().unwrap_or(false) {
-            return Ok(());
-        }
-        globals.set("dirty", false)?;
-        self.commands.clear();
-        self.update_functions.clear();
-        self.bodies.clear();
-        self.root = globals.get("root").ok();
+        let ui = globals.get::<AnyUserData>("ui")?.borrow::<UIRenderContext>()?;
 
-        if let Some(root) = self.root.clone() {
-            let size = self.vec_table(nvg.width(None), nvg.height(None)).unwrap();
-            let pos = self.vec_table(0.0, 0.0).unwrap();
-            root.set("size", size.clone())?;
-            root.set("pos", pos.clone())?;
-            self.update_component(root, nvg).unwrap();
-        }
-        Ok(())
-    }
-
-    fn update_component(&mut self, component: Table, nvg: &mut NvgContext) -> Option<()> {
-        let typ: Value = component.get("type").ok()?;
-        let update: Value = component.get("update").ok()?;
-        if !update.is_nil() {
-            if let Some(update) = update.as_function() {
-                self.update_functions.push((component.clone(), update.clone()));
+        let mut nvg = ui.nvg.borrow_mut();
+        nvg.set_size((width, height));
+        drop(nvg);
+        drop(ui);
+        if globals.get::<bool>("dirty")? {
+            globals.set("dirty", false)?;
+            if let Some(render) = &self.render_function {
+                render.call::<()>(())?;
             }
         }
-        let on_dirty: Value = component.get("onDirty").ok()?;
-        if !on_dirty.is_nil() {
-            if let Some(on_dirty) = on_dirty.as_function() {
-                on_dirty.call::<()>(component.clone()).unwrap();
-            }
+        if let Some(update) = &self.update_function {
+            update.call::<()>(())?;
         }
 
-        match typ.as_string().unwrap().to_string_lossy().as_str() {
-            "root" => {
-                let (x, y, w, h) = Self::component_bounds(&component)?;
+        let ui = globals.get::<AnyUserData>("ui")?.borrow::<UIRenderContext>()?;
+        let mut nvg = ui.nvg.borrow_mut();
+        nvg.begin_frame((width, height));
 
-                if let Some(children) = component.get::<Table>("children").ok() {
-                    for child in children.sequence_values::<Table>().map(|v| v.unwrap()) {
-                        let size = self.vec_table(w, h)?;
-                        let pos = self.vec_table(x, y)?;
-                        child.set("size", size).ok()?;
-                        child.set("pos", pos).ok()?;
-
-                        child.set("parent", component.clone()).ok()?;
-                        self.update_component(child, nvg);
-                    }
-                }
-            }
-            "group" => {
-                let group_flow = Self::component_get_string(&component, "flow")?;
-                let children = component.get::<Table>("children").ok()?;
-                let mut sum = 0.0f32;
-                for child in children.sequence_values::<Table>() {
-                    let child = child.ok()?;
-                    let w: Value = child.get(1).ok()?;
-                    sum += w.as_f32()?;
-                }
-                let (mut x, mut y, w, h) = Self::component_bounds(&component)?;
-                for child in children.sequence_values::<Table>() {
-                    let (weight, child) = child.ok().and_then(|c| {
-                        Some((c.get::<Value>(1).ok()?.as_f32()? / sum, c.get::<Table>(2).ok()?))
-                    })?;
-                    child.set("parent", component.clone()).ok()?;
-                    let (dx, w) = match group_flow.as_str() {
-                        "h" | "hor" | "ho" => (weight * w, weight * w),
-                        _ => (0.0, w)
-                    };
-                    let (dy, h) = match group_flow.as_str() {
-                        "v" | "ver" | "ve" | "vert" => (weight * h, weight * h),
-                        _ => (0.0, h)
-                    };
-                    child.set("pos", self.vec_table(x, y)).ok()?;
-                    child.set("size", self.vec_table(w, h)).ok()?;
-                    self.update_component(child, nvg);
-                    x += dx;
-                    y += dy;
-                }
-            }
-            "rect" => {
-                let color = Self::from_table_color(component.get("color").ok()?)?;
-                let (x, y, w, h) = Self::component_bounds(&component)?;
-                self.commands.push(RenderCommand::ShapeColor(Shape::Rect(x, y, w, h), color));
-            }
-            "videoSurface" => {
-                let surface: Value = component.get::<Value>("surface").ok()?;
-                if surface.is_nil() {
-                    component.set("surface", VideoSurface::new()).ok()?
-                }
-                let surface = component.get::<AnyUserData>("surface").ok()?;
-                let (x, y, w, h) = Self::component_bounds(&component)?;
-                self.commands.push(RenderCommand::VideoSurfaceDraw(Shape::Rect(x, y, w, h), surface, None))
-            }
-            "raw" => {
-                let render = component.get::<Function>("render").ok()?;
-                let result = render.call::<Value>(component).ok()?;
-                for child in result.as_table()?.sequence_values::<Table>() {
-                    self.commands.push(Self::get_raw_render_command(&child.ok()?)?);
-                }
-            }
-            _ => {}
-        }
-        Some(())
-    }
-
-    fn get_raw_render_command(table: &Table) -> Option<RenderCommand> {
-        let name = table.get::<String>(1).ok()?;
-        match name.as_str() {
-            "shapeColor" => {
-                let color = Self::from_table_color(table.get("color").ok()?)?;
-                let shape = Self::from_table_shape(table.get("shape").ok()?)?;
-                Some(RenderCommand::ShapeColor(shape, color))
-            }
-            _ => None
-        }
-    }
-
-    fn from_table_shape(table: Table) -> Option<Shape> {
-        let name = table.get::<String>("name").ok()?;
-        match name.as_str() {
-            "rect" => {
-                let x: f32 = table.get(1).ok()?;
-                let y: f32 = table.get(2).ok()?;
-                let w: f32 = table.get(3).ok()?;
-                let h: f32 = table.get(4).ok()?;
-                Some(Shape::Rect(x, y, w, h))
-            }
-            _ => None
-        }
-    }
-
-    pub fn dirty(&mut self) {
-        self.lua.globals().set("dirty", true).unwrap();
-    }
-
-    fn from_table_color(table: Table) -> Option<Color> {
-        let r: Value = table.get(1).ok()?;
-        let g: Value = table.get(2).ok()?;
-        let b: Value = table.get(3).ok()?;
-        let a: Value = table.get(4).ok()?;
-        Some(Color::rgba(r.as_f32()?, g.as_f32()?, b.as_f32()?, a.as_f32()?))
-    }
-
-    fn from_table_vec(table: Table) -> Option<(f32, f32)> {
-        let x: Value = table.get(1).ok()?;
-        let y: Value = table.get(2).ok()?;
-        Some((x.as_f32()?, y.as_f32()?))
-    }
-
-    fn component_bounds(component: &Table) -> Option<(f32, f32, f32, f32)> {
-        let (px, py) = Self::component_get_vec_opt(component, "prefPos").unwrap_or((None, None));
-        let (pw, ph) = Self::component_get_vec_opt(component, "prefSize").unwrap_or((None, None));
-        let (w, h) = Self::component_get_vec(component, "size")?;
-        let (x, y) = Self::component_get_vec(component, "pos")?;
-
-        Some((px.unwrap_or(x), py.unwrap_or(y), pw.unwrap_or(w), ph.unwrap_or(h)))
-    }
-
-    fn vec_table(&self, x: f32, y: f32) -> Option<Table> {
-        let table = self.lua.create_table().ok()?;
-        table.set(1, x).ok()?;
-        table.set(2, y).ok()?;
-        Some(table)
-    }
-
-    fn component_get_pref_or_vec(component: &Table, pref: &str, or: &str) -> Option<(f32, f32)> {
-        Self::component_get_vec(component, pref)
-            .or_else(|| Self::component_get_vec(component, or))
-    }
-
-    fn component_get_vec_opt(component: &Table, name: &str) -> Option<(Option<f32>, Option<f32>)> {
-        let table: Table = component.get(name).ok()?;
-        let x = table.get::<f32>(1).ok();
-        let y = table.get::<f32>(2).ok();
-        Some((x, y))
-    }
-
-    fn component_get_vec(component: &Table, name: &str) -> Option<(f32, f32)> {
-        let table = component.get(name).ok()?;
-        Self::from_table_vec(table)
-    }
-
-    fn component_get_string(component: &Table, name: &str) -> Option<String> {
-        let value: Value = component.get(name).ok()?;
-        value.as_string().map(|s| s.to_string_lossy())
-    }
-
-    fn get_body(component: Table) -> Option<(Shape, Table)> {
-        todo!()
-    }
-
-    pub fn render(&mut self, nvg: &mut NvgContext) {
-        for command in self.commands.iter_mut() {
-            match command {
-                RenderCommand::VideoSurfaceDraw(shape, comp, image) => {
-                    let mut surface = comp.borrow_mut::<VideoSurface>().unwrap();
-                    surface.update();
-                    if let Some(_) = surface.size_update.take() {
-                        if let Some(image) = image.take() {
-                            nvg.delete_image(image);
-                        }
-                        *image = nvg.create_texture_image(&surface.output_texture);
-                    }
-                    if image.is_none() {
-                        *image = nvg.create_texture_image(&surface.output_texture);
-                    }
-                    if let Some(image) = image {
-                        nvg.begin_path();
-                        let (_, _, w, h) = shape.bounds();
-                        let (pw, ph) = image.size_conserve_aspect_ratio(w, h);
-                        let ox = (w - pw) / 2.0;
-                        let oy = (h - ph) / 2.0;
-                        let shape = shape.scale_xy(pw / w, ph / h, true);
-                        let paint = nvg.image_paint(image, shape, 1.0);
-                        nvg.draw_shape(shape);
-                        nvg.fill_paint(paint);
-                        nvg.fill();
-                    }
-                }
+        for cmd in ui.list.iter() {
+            match *cmd {
                 RenderCommand::ShapeColor(shape, color) => {
                     nvg.begin_path();
-                    nvg.draw_shape(*shape);
-                    nvg.fill_color(*color);
-                    nvg.fill();
-                }
-                RenderCommand::TextBox(text, color, shape, width, height) => {
-                    nvg.begin_path();
-                    nvg.fill_color(*color);
-                    let (_, _, w, h) = shape.bounds();
-                    nvg.fit_text(text, w, h);
-                    nvg.draw_text_inside(text, *shape, *width, *height);
+                    nvg.draw_shape(shape);
+                    nvg.fill_color(color);
                     nvg.fill();
                 }
             }
         }
+
+        nvg.end_frame();
+        Ok(())
     }
 
+    pub fn handle_event(&mut self, event: WindowEvent) -> mlua::Result<()> {
+        let event = match event.clone() {
+            WindowEvent::FramebufferSize(w, h) => {
+                self.set_dirty()?;
+                self.window_size = (w as f32, h as f32);
+                None
+            }
+            WindowEvent::CursorPos(x, y) => {
+                let to = (x as f32, y as f32);
+                let from = self.mouse_position;
+                self.mouse_position = to;
+                Some(InputEvent::MouseMoved(from, to))
+            }
+            WindowEvent::Key(key, _, action, _) => {
+                Some(InputEvent::Key(key, action))
+            }
+            _ => None
+        };
+        if let Some((on_event, event)) = self.event_function.as_ref().zip(event) {
+            on_event.call::<()>(event)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_dirty(&self) -> Result<(), mlua::Error> {
+        self.lua.globals().set("dirty", true)?;
+        Ok(())
+    }
 }

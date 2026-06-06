@@ -97,8 +97,8 @@ impl Window {
         todo!()
     }
 
-    pub fn get_size(&self) -> (f32, f32) {
-        let (w, h) = self.window.get_size();
+    pub fn get_framebuffer_size(&self) -> (f32, f32) {
+        let (w, h) = self.window.get_framebuffer_size();
         (w as f32, h as f32)
     }
 }

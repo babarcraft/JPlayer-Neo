@@ -102,7 +102,7 @@ impl Shape {
             }
         }
     }
-    
+
     pub fn scale_xy(&self, sx: f32, sy: f32, centered: bool) -> Shape {
         match *self {
             Shape::Rect(x, y, w, h) => {
@@ -425,6 +425,22 @@ impl NvgContext {
             nvgEndFrame(self.context);
         }
     }
+
+    pub fn set_size(&mut self, size: (f32, f32)) {
+        self.size = size;
+    }
+
+    pub fn begin_frame(&mut self, size: (f32, f32)) {
+        unsafe {
+            nvgBeginFrame(self.context, size.0, size.1, 1.0);
+        }
+    }
+
+    pub fn end_frame(&mut self) {
+        unsafe {
+            nvgEndFrame(self.context);
+        }
+    }
     
     pub fn begin_path(&mut self) {
         unsafe {
@@ -692,7 +708,7 @@ impl NvgContext {
     pub fn relative(&self, px: f32, py: f32) -> (f32, f32) {
         (self.width(Some(px)), self.height(Some(py)))
     }
-    
+
     pub fn handle_command(&mut self, command: DrawCommand) {
         match command {
             DrawCommand::ShapeColor(shape, color) => {
