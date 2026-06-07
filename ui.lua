@@ -1,3 +1,4 @@
+---@diagnostic disable: undefined-global
 glfw = require("glfw")
 
 local RenderCommand = {
@@ -10,63 +11,148 @@ local RenderCommand = {
 	end
 }
 
-local function componentBounds(comp)
-	local w, h = comp.size.w or 0.0, comp.size.h or 0.0
-	local x, y = comp.pos.x or 0.0, comp.pos.y or 0.0
+local function componentSetup(props)
+	props.bounds = function(self)
+		local w, h = self.size.w or 0.0, self.size.h or 0.0
+		local x, y = self.pos.x or 0.0, self.pos.y or 0.0
 
-	local pref = comp.prefSize
-	if pref then
-		w = pref.w or w
-		h = pref.h or h
-	end
-	local pref = comp.prefPos
-	if pref then
-		x = pref.x or x
-		y = pref.y or y
-	end
+		local pref = self.prefSize
+		if pref then
+			w = pref.w or w
+			h = pref.h or h
+		end
+		local pref = self.prefPos
+		if pref then
+			x = pref.x or x
+			y = pref.y or y
+		end
 
-	local padding = comp.padding
-	if padding then
-		local left = padding.left or 0.0
-		local right = padding.right or 0.0
-		local bottom = padding.bottom or 0.0
-		local top = padding.top or 0.0
-		w = w - left - right;
-		h = h - top - bottom;
-		x = x + left;
-		y = y + bottom;
-	end
+		local padding = self.padding
+		if padding then
+			local left = padding.left or 0.0
+			local right = padding.right or 0.0
+			local bottom = padding.bottom or 0.0
+			local top = padding.top or 0.0
+			w = w - left - right;
+			h = h - top - bottom;
+			x = x + left;
+			y = y + bottom;
+		end
 
-	return x, y, w, h
+		return x, y, w, h
+	end
+end
+
+local function ternary(cond, a, b)
+	if cond then
+		return a
+	else
+		return b
+	end
 end
 
 local Component = {
 	Root = function(props)
+		componentSetup(props)
+
 		props.render = function(self)
+			local x, y, w, h = self:bounds()
 			for _, child in ipairs(self.children) do
-				child.size = self.size;
-				child.pos = self.pos;
-				child.parent = self.parent;
+				child.size = { w = w, h = h };
+				child.pos = { x = x, y = y };
+				child.parent = self;
 				if child.render then
 					child:render()
 				end
 			end
 		end
 		props.getChildrenList = function(self)
+			return self.children
+		end
+		return props
+	end,
+
+	Group = function(props)
+		componentSetup(props)
+		props.render = function(self)
+			local flow = self.flow
+			local fx = flow == "right"
+			local fy = flow == "up"
+			local x, y, w, h = self:bounds()
+			local sum = 0.0
+			for _, child in ipairs(self.children) do
+				local wi, _ = table.unpack(child)
+				sum = sum + wi
+			end
+			for _, child in ipairs(self.children) do
+				local wi, child = table.unpack(child)
+				wi = wi / sum
+				local cw = ternary(fx, w * wi, nil)
+				local dx = cw or 0.0
+				local ch = ternary(fy, h * wi, nil)
+				local dy = ch or 0.0
+				if child then
+					print(fx, fy, cw, dx, ch, dy)
+					child.size = { w = cw or w, h = ch or h };
+					child.pos = { x = x, y = y };
+					child.parent = self;
+					if child.render then
+						child:render()
+					end
+				end
+				x = x + dx;
+				y = y + dy;
+			end
+		end
+		props.getChildrenList = function(self)
 			local children = {}
 			for i, v in pairs(self.children) do
-				table.insert(children, v)
+				local _, child = table.unpack(v)
+				if child then
+					table.insert(children, child)
+				end
 			end
 			return children
 		end
-		props.bounds = componentBounds
+		return props
+	end,
+
+	Slider = function(props)
+		componentSetup(props)
+		props.render = function(self)
+			local x, y, w, h = self:bounds(self)
+			local p = self.progress or 0.0
+			ui:push {
+				"shapeColor",
+				shape = { "rect", x, y, w, h },
+				color = self.background
+			}
+
+			self.cmd = {
+				"shapeColor",
+				shape = { "rect", x, y, w * p, h },
+				color = self.foreground
+			}
+			ui:push {
+				"indirect",
+				command = self.cmd
+			}
+		end
+		props.setPosition = function(self, p)
+			self.progress = p
+			local p = self.progress or 0.0
+			local x, y, w, h = self:bounds(self)
+			self.cmd.shape = { "rect", x, y, w * p, h };
+			self.cmd.color = self.foreground;
+			self.cmd.dirty = true
+		end
 		return props
 	end,
 
 	VideoPlayer = function(path)
 		local surface = ui:newVideoSurface()
 		local player = ui:newVideoPlayer(path, surface)
-		return {
+		local props = {
 			surface = surface,
 			player = player,
 			render = function(self)
@@ -84,11 +170,45 @@ local Component = {
 			play = function(self)
 				return self.player.player:play()
 			end,
-			bounds = componentBounds
 		}
+		componentSetup(props)
+		return props
+	end,
+
+	Label = function(props)
+		componentSetup(props)
+		props.render = function(self)
+            self.text = ui:newText(self.str or "", self.font or "default", self.fontSize or 16.0)
+			local x, y, w, h = self:bounds(self)
+			local wx = {
+			    right = 1.0,
+			    center = 0.5,
+			    left = 0.0
+			}
+			local wy = {
+			    top = 1.0,
+			    center = 0.5,
+			    bottom = 0.0
+			}
+			ui:fitText(self.text, w, h)
+			local tx, ty, tw, th = self.text:bounds()
+			self.text.x = x + (w - tw) * wx[self.alignHorizontal or "center"]
+			self.text.y = y + (h - th) * wy[self.alignVertical or "center"]
+			ui:push {
+				"textFill",
+				text = self.text,
+				color = self.color
+			}
+		end
+        props.setText = function(self, text)
+            ui:setText(self.text, text)
+        end
+
+		return props
 	end,
 
 	Rect = function(props)
+		componentSetup(props)
 		props.render = function(self)
 			local x, y, w, h = self:bounds(self)
 			ui:push {
@@ -97,16 +217,11 @@ local Component = {
 				color = self.color
 			}
 		end
-		props.bounds = componentBounds
 
 		return props
 	end,
 }
 
-
-function dirty()
-	dirty = true
-end
 
 function dump(o)
 	if type(o) == 'table' then
@@ -181,31 +296,70 @@ function event(e)
 end
 
 function update()
+	local pl = player.player
+	local player = pl.player
+	if player and timeline then
+		local last = pl.lastPts or 0.0
+		local pts = player.pts
+		local diff = pts - last
+		if diff < 0.0 then
+			diff = -diff
+		end
+		if diff >= 0.1 then
+			timeline:setPosition(pts / player.duration)
+			pl.lastPts = pts
+		end
+	end
 end
 
 player = Component.VideoPlayer("tt.webm")
-player.onMouseButton = function(self, e)
-	print("Player Clicked yay!!")
-	self.cmd.shape[2] = 20.0 + self.cmd.shape[2];
-	self.cmd.dirty = true;
-end
-player.prefSize = { w = 250.0, h = 250.0 }
-player.prefPos = { x = 100.0, y = 100.0 }
 player:play()
+
+timeline = Component.Slider {
+	background = { 0.2, 0.4, 0.5, 1.0 },
+	foreground = { 0.2, 1.0, 1.0, 1.0 },
+	onMouseButton = function(self, e)
+		if e.action ~= glfw.action.release then
+			return
+		end
+		local mx = e.pos.x
+		local x, _, w, _ = self:bounds()
+		local player = player.player.player
+		player:seek(player.duration * ((mx - x) / w))
+	end
+}
 
 root = Component.Root {
 	children = {
-		Component.Rect {
-			color = { 1.0, 0.2, 0.3, 1.0 },
-			padding = {
-				bottom = 50.0,
-				right = 20.0
+		player,
+		Component.Root {
+			children = {
+				Component.Rect {
+					color = { 0.7, 0.3, 1.0, 1.0 },
+					padding = {
+						top = 15.0, right = 15.0,
+						left = 15.0, bottom = 15.0
+					},
+				},
+				Component.Group {
+					flow = "up",
+					children = {
+						{ 2.0, Component.Label {
+						    alignHorizontal = "left",
+                            color = { 1.0, 1.0, 1.0, 1.0 },
+                            str = "Bro I am testing"
+                        },},
+						{ 1.0, timeline },
+						{ 2.0, nil },
+					},
+					padding = {
+						top = 15.0, right = 15.0,
+						left = 15.0, bottom = 15.0
+					},
+				},
 			},
-			onMouseButton = function(self, e)
-				print("Rect Clicked yay!! Im... E-Rect... get it?...")
-			end
+			prefSize = { h = 200.0 }
 		},
-		player
 	},
 	onMouseButton = function(self, e)
 		print("Root... I don't care about you")
@@ -235,6 +389,12 @@ function render()
 
 		bodies = getBodies(root)
 	end
+end
+
+function onKey(e)
+    if e.action ~= glfw.action.release then
+        return
+    end
 end
 
 return {

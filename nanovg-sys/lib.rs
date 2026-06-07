@@ -143,6 +143,17 @@ pub struct NVGglyphPosition {
     pub maxx: c_float,
 }
 
+impl Default for NVGglyphPosition {
+    fn default() -> Self {
+        NVGglyphPosition {
+            s: std::ptr::null(),
+            x: 0.0,
+            minx: 0.0,
+            maxx: 0.0,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug)]
 pub struct NVGtextRow {

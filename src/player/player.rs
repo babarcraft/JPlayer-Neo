@@ -295,14 +295,3 @@ impl Drop for VideoPlayer {
         }
     }
 }
-
-impl UserData for VideoPlayer {
-
-    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method_mut("play", |_, this, _args: ()| {
-            this.play();
-            Ok(())
-        });
-    }
-
-}

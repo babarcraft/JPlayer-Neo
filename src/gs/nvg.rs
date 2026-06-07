@@ -1,5 +1,5 @@
 use std::ffi;
-use std::ffi::{c_int, CStr, CString};
+use std::ffi::{c_int, c_void, CStr, CString};
 use std::fs::File;
 use std::io::Read;
 use std::ops::Range;
@@ -175,6 +175,7 @@ pub struct Text {
     matrics: TextMatrics,
     dirty: bool,
     fit: bool,
+    pub range: Option<Range<usize>>,
     pub(crate) x: f32,
     pub(crate) y: f32,
 }
@@ -195,8 +196,13 @@ impl TextMatrics {
 impl Text {
     
     pub fn bounds(&self) -> (f32, f32, f32, f32) {
-        let w = self.glyph_positions.last()
-            .zip(self.glyph_positions.first())
+        let glyphs = if let Some(range) = &self.range {
+            &self.glyph_positions[range.clone()]
+        } else {
+            &self.glyph_positions
+        };
+        let w = glyphs.last()
+            .zip(glyphs.first())
             .map(|(last, first)| {
                 let min = last.minx.min(first.minx);
                 let max = last.maxx.max(first.maxx);
@@ -224,6 +230,23 @@ impl Text {
         let glyph = self.glyph_positions.get(index)?;
         let minx = glyph.minx;
         Some((self.x + minx, self.y - self.matrics.descender, glyph.maxx - minx, self.matrics.line_height))
+    }
+    
+    pub fn fit_range_shrink_end(&self, offset: usize, width: f32) -> Option<Range<usize>> {
+        let (x0, y0, xf0, yf0) = self.char_bounds_absolute(offset)?;
+        let mut end = self.len();
+        let (x, y, xf, yf) = self.char_bounds_absolute(end)?;
+        let mut w = xf - x0;
+        while w > width {
+            if end >= offset {
+                end -= 1;
+            } else {
+                return None
+            }
+            let (x, y, xf, yf) = self.char_bounds_absolute(end)?;
+            w = xf - x0;
+        }
+        Some(offset..end)
     }
 
     pub fn char_range_bounds(&self, range: Range<usize>) -> Option<(f32, f32, f32, f32)> {
@@ -286,6 +309,29 @@ impl Text {
         self.dirty = true;
         char
     }
+    
+    pub fn set_str(&mut self, string: &str) {
+        self.data.clear();
+        self.data.extend(string.chars());
+        self.glyph_positions.clear();
+        self.dirty = true;
+    }
+    
+    pub fn as_str(&self) -> &str {
+        self.data.as_str()
+    }
+
+    pub fn to_ptrs(&self) -> (*const c_char, *const c_char) {
+        unsafe {
+            let mut begin = self.data.as_ptr();
+            let mut end = begin.add(self.data.len());
+            if let Some(range) = &self.range {
+                begin = begin.add(range.start);
+                end = begin.add(range.len());
+            }
+            (begin as *const c_char, end as *const c_char)
+        }
+    }
 
     pub fn split_at(&mut self, index: usize) -> Option<Self> {
         let offset = self.glyph_positions.get(index).map(|glyph| glyph.minx).unwrap_or(0.0);
@@ -308,6 +354,7 @@ impl Text {
             matrics: self.matrics,
             dirty: true,
             fit: false,
+            range: None,
             x: self.x,
             y: self.y,
         })
@@ -316,7 +363,7 @@ impl Text {
     pub fn len(&self) -> usize {
         self.data.len()
     }
-
+    
 }
 
 #[derive(Debug, Clone)]
@@ -345,12 +392,6 @@ pub fn string_to_ptr_end(string: &str) -> (*const c_char, *const c_char) {
         let end = ptr.add(string.len());
         (ptr, end)
     }
-}
-
-pub enum DrawCommand<'a> {
-    TextBox(Shape, &'a Text, Color, TextHorizontalAlignment, TextVerticalAlignment),
-    ShapeColor(Shape, Color),
-    ShapeImage(Shape, &'a Image),
 }
 
 impl NvgContext {
@@ -388,10 +429,9 @@ impl NvgContext {
 
     pub fn draw_text(&mut self, text: &Text) {
         unsafe {
-            let data = &text.data;
-            let (ptr, end) = string_to_ptr_end(data);
+            let (ptr, end) = text.to_ptrs();
             self.set_font(text.font.as_str(), text.font_size);
-            nvgText(self.context, text.x, self.invert_y(text.y, 0.0), ptr, end);
+            nvgText(self.context, text.x, self.invert_y(text.y + self.text_matrics.descender, 0.0), ptr, end);
         }
     }
 
@@ -536,6 +576,7 @@ impl NvgContext {
                 matrics: self.text_matrics.clone(),
                 dirty: true,
                 fit: false,
+                range: None,
                 x: 0.0,
                 y: 0.0
             }
@@ -708,29 +749,5 @@ impl NvgContext {
     
     pub fn relative(&self, px: f32, py: f32) -> (f32, f32) {
         (self.width(Some(px)), self.height(Some(py)))
-    }
-
-    pub fn handle_command(&mut self, command: DrawCommand) {
-        match command {
-            DrawCommand::ShapeColor(shape, color) => {
-                self.begin_path();
-                self.draw_shape(shape);
-                self.fill_color(color);
-                self.fill();
-            }
-            DrawCommand::ShapeImage(shape, image) => {
-                self.begin_path();
-                self.draw_shape(shape);
-                let paint = self.image_paint(&image, shape, 1.0);
-                self.fill_paint(paint);
-                self.fill();
-            }
-            DrawCommand::TextBox(shape, text, color, horiz, vert) => {
-                self.begin_path();
-                self.fill_color(color);
-                self.draw_text_inside(text, shape, horiz, vert);
-                self.fill();
-            }
-        }
     }
 }

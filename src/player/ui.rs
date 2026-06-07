@@ -4,7 +4,7 @@ use crate::player::decoder::DecodeWorker;
 use crate::player::input::InputWorker;
 use crate::player::surface::VideoSurface;
 use glfw::{Action, Key, MouseButton, WindowEvent};
-use mlua::{AnyUserData, AsChunk, Function, IntoLua, Lua, Table, UserData, UserDataFields, UserDataMethods, Value};
+use mlua::{AnyUserData, AsChunk, Function, IntoLua, IntoLuaMulti, Lua, MultiValue, Table, UserData, UserDataFields, UserDataMethods, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
 use crate::ffmpeg::input::Input;
@@ -20,7 +20,8 @@ pub enum InputEvent {
 pub enum RenderCommand {
     ShapeColor(Shape, Color),
     VideoSurface(AnyUserData, Shape, Option<Image>),
-    Indirect(Table, Option<Box<RenderCommand>>)
+    TextFill(AnyUserData, Color),
+    Indirect(Table, Box<Option<RenderCommand>>)
 }
 
 impl UserData for RenderCommand {}
@@ -28,12 +29,84 @@ impl UserData for RenderCommand {}
 impl UserData for VideoSurface {}
 impl UserData for InputWorker {}
 impl UserData for DecodeWorker {}
-impl UserData for Text {
+impl UserData for VideoPlayer {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("pts", |_, this| {
+            Ok(this.current_pts())
+        });
+        fields.add_field_method_get("duration", |_, this| {
+            Ok(this.estimated_duration)
+        });
+    }
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method_mut("draw", |_, this, (text): (String)| {
-            this.clear();
-            this.push_str(&text);
+        methods.add_method_mut("play", |_, this, _args: ()| {
+            this.play();
             Ok(())
+        });
+        methods.add_method_mut("seek", |_, this, (target): (f64)| {
+            this.seek(target);
+            Ok(())
+        });
+    }
+
+}
+impl UserData for Text {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_set("x", |_, this, x: f32| {
+            this.x = x;
+            Ok(())
+        });
+        fields.add_field_method_set("y", |_, this, y: f32| {
+            this.y = y;
+            Ok(())
+        });
+        fields.add_field_method_get("len", |_, this| {
+            Ok(this.len())
+        });
+        fields.add_field_method_set("range", |lua, this, range: Value| {
+            this.range = if let Some(range) = range.as_table() {
+                let begin = range.get::<Value>(1)?.as_usize();
+                let end = range.get::<Value>(2)?.as_usize();
+                if begin.is_none() && end.is_none() {
+                    None
+                } else {
+                    let begin = begin.unwrap_or(0);
+                    let end = end.unwrap_or(this.len());
+                    Some(begin..end)
+                }
+            } else {
+                None
+            };
+            Ok(())
+        })
+    }
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("bounds", |lua, this, (begin, end): (Option<usize>, Option<usize>)| {
+            let result: Option<(f32, f32, f32, f32)> = if begin.is_none() && end.is_none() {
+                Some(this.bounds())
+            } else {
+                let begin = begin.unwrap_or(0);
+                let end = end.unwrap_or(this.len());
+
+                this.char_range_bounds(begin..end)
+            };
+
+            Ok(match result {
+                Some(result) => result.into_lua_multi(lua)?,
+                None => mlua::MultiValue::new()
+            })
+        });
+        methods.add_method("boundsRange", |lua, this, (begin, end): (usize, usize)| {
+            if let Some((x, y, w, h)) = this.char_range_bounds(begin..end) {
+                Ok(Value::Table(lua.create_table_from([
+                    (1, Value::Number(x as f64)),
+                    (2, Value::Number(y as f64)),
+                    (3, Value::Number(w as f64)),
+                    (4, Value::Number(h as f64)),
+                ])?))
+            } else {
+                Ok(Value::Nil)
+            }
         })
     }
 }
@@ -96,12 +169,18 @@ impl UIRenderContext {
                     command.take();
                 }
                 if command.is_none() {
-                    let cmd = table.clone().try_into()?;
-                    *command = Some(Box::new(cmd));
+                    let cmd: RenderCommand = table.clone().try_into()?;
+                    *(*command) = Some(cmd);
                 }
-                if let Some(command) = command {
+                if let Some(command) = command.as_mut() {
                     Self::render_command(&mut *command, nvg)?;
                 }
+            },
+            RenderCommand::TextFill(text, color) => {
+                nvg.begin_path();
+                nvg.fill_color(*color);
+                nvg.draw_text(&mut *text.borrow_mut()?);
+                nvg.fill();
             }
         }
         Ok(())
@@ -124,8 +203,8 @@ impl TryFrom<Table> for Shape {
     type Error = mlua::Error;
 
     fn try_from(value: Table) -> Result<Self, Self::Error> {
-        let type_ = value.get::<String>(1)?;
-        match type_.as_str() {
+        let type_ = value.get::<mlua::String>(1)?;
+        match type_.to_str()?.as_ref() {
             "rect" => {
                 let x = value.get::<f32>(2)?;
                 let y = value.get::<f32>(3)?;
@@ -133,7 +212,7 @@ impl TryFrom<Table> for Shape {
                 let height = value.get::<f32>(5)?;
                 Ok(Shape::Rect(x, y, width, height))
             }
-            _ => Err(Self::Error::RuntimeError(format!("Unknown shape: {}", type_))),
+            _ => Err(Self::Error::RuntimeError(format!("Unknown shape: {}", type_.to_str()?.as_ref()))),
         }
     }
 }
@@ -142,8 +221,8 @@ impl TryFrom<Table> for RenderCommand {
     type Error = mlua::Error;
 
     fn try_from(value: Table) -> Result<Self, Self::Error> {
-        let type_ = value.get::<String>(1)?;
-        match type_.as_str() {
+        let type_ = value.get::<mlua::String>(1)?;
+        match type_.to_str()?.as_ref() {
             "shapeColor" => {
                 let shape: Shape = value.get::<Table>("shape")?.try_into()?;
                 let color: Color = value.get::<Table>("color")?.try_into()?;
@@ -154,11 +233,16 @@ impl TryFrom<Table> for RenderCommand {
                 let shape: Shape = value.get::<Table>("shape")?.try_into()?;
                 Ok(RenderCommand::VideoSurface(surface, shape, None))
             }
+            "textFill" => {
+                let text: AnyUserData = value.get::<AnyUserData>("text")?;
+                let color = value.get::<Table>("color")?.try_into()?;
+                Ok(RenderCommand::TextFill(text, color))
+            }
             "indirect" => {
                 let command = value.get::<Table>("command")?;
-                Ok(RenderCommand::Indirect(command, None))
+                Ok(RenderCommand::Indirect(command, Box::new(None)))
             }
-            _ => Err(Self::Error::RuntimeError(format!("Unknown shape: {}", type_))),
+            _ => Err(Self::Error::RuntimeError(format!("Unknown shape: {}", type_.to_str()?.as_ref()))),
         }
     }
 }
@@ -177,9 +261,20 @@ impl UserData for UIRenderContext {
             table.set("h", h)?;
             Ok(table)
         });
-        methods.add_method_mut("newText", |_, this, (text, font, size): (String, String, f32)| {
-            let text = this.nvg.borrow_mut().text(text.as_str(), &font, size);
+        methods.add_method_mut("newText", |_, this, (text, font, size): (mlua::String, mlua::String, f32)| {
+            let text = this.nvg.borrow_mut().text(text.to_str()?.as_ref(), font.to_str()?.as_ref(), size);
             Ok(text)
+        });
+        methods.add_method("setText", |_, this, (text, set): (AnyUserData, mlua::String)| {
+            let mut text = text.borrow_mut::<Text>()?;
+            text.set_str(set.to_str()?.as_ref());
+            this.nvg.borrow_mut().update_text(&mut *text);
+            Ok(())
+        });
+        methods.add_method("fitText", |_, this, (text, width, height): (AnyUserData, Option<f32>, Option<f32>)| {
+            let mut text = text.borrow_mut::<Text>()?;
+            this.nvg.borrow_mut().fit_text(&mut *text, width.unwrap_or(f32::MAX), height.unwrap_or(f32::MAX));
+            Ok(())
         });
         methods.add_method_mut("newVideoSurface", |_, this, (): ()| {
             Ok(VideoSurface::new())
