@@ -386,7 +386,7 @@ impl InputWorkerContext {
     fn do_pass(&mut self) -> bool {
         let mut available = self.inputs.iter_mut()
             .filter(|pair| pair.begin)
-            .filter(|pair| !pair.input.eof)
+            .filter(|pair| !pair.input.read_error)
             .filter(|pair|
                 pair.min_queued()
                     .and_then(|q| Some(q < 5.0))
@@ -406,12 +406,8 @@ impl InputWorkerContext {
                     }
                 },
                 Err(error) => {
-                    pair.input.flush();
                     eprintln!("Read error: {:?}", error);
                 }
-            }
-            if pair.input.eof {
-                println!("Eof but what the hell?")
             }
         }
         empty

@@ -202,6 +202,7 @@ local Component = {
 		end
         props.setText = function(self, text)
             ui:setText(self.text, text)
+            self.str = text
         end
 
 		return props
@@ -295,6 +296,16 @@ function event(e)
 	end
 end
 
+function format_time(seconds)
+    local seconds = seconds
+    local hours = math.floor(seconds / 3600.0)
+    seconds = seconds - hours * 3600.0
+    local minutes = math.floor(seconds / 60.0)
+    seconds = seconds - minutes * 60.0
+    seconds = math.floor(seconds)
+    return string.format("%02d:%02d:%02d", hours, minutes, seconds)
+end
+
 function update()
 	local pl = player.player
 	local player = pl.player
@@ -308,6 +319,8 @@ function update()
 		if diff >= 0.1 then
 			timeline:setPosition(pts / player.duration)
 			pl.lastPts = pts
+			time_passed:setText(format_time(pts))
+			time_rem:setText(format_time(player.duration - pts))
 		end
 	end
 end
@@ -329,6 +342,17 @@ timeline = Component.Slider {
 	end
 }
 
+time_passed = Component.Label {
+    alignHorizontal = "left",
+    color = { 1.0, 1.0, 1.0, 1.0 },
+    str = "00:00:00"
+}
+time_rem = Component.Label {
+    alignHorizontal = "right",
+    color = { 1.0, 1.0, 1.0, 1.0 },
+    str = "00:00:00"
+}
+
 root = Component.Root {
 	children = {
 		player,
@@ -344,11 +368,14 @@ root = Component.Root {
 				Component.Group {
 					flow = "up",
 					children = {
-						{ 2.0, Component.Label {
-						    alignHorizontal = "left",
-                            color = { 1.0, 1.0, 1.0, 1.0 },
-                            str = "Bro I am testing"
-                        },},
+						{ 2.0, Component.Group {
+						    flow = "right",
+						    children = {
+						        { 1.0, time_passed},
+                                { 3.0, nil },
+						        { 1.0, time_rem}
+						    }
+						}},
 						{ 1.0, timeline },
 						{ 2.0, nil },
 					},

@@ -136,7 +136,7 @@ pub struct Input {
     pub streams: Vec<Stream>,
     pub serial: u32,
     pub id: usize,
-    pub eof: bool,
+    pub read_error: bool,
     after_seek: bool
 }
 
@@ -187,7 +187,7 @@ impl Input {
                 options: options.iter().map(|&(k, v)| (k.to_string(), v.to_string())).collect(),
                 path: path.to_string(),
                 id: INPUT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                eof: false,
+                read_error: false,
                 after_seek: false,
                 streams
             })
@@ -224,7 +224,8 @@ impl Input {
 
             self.streams = std::slice::from_raw_parts((*self.context).streams, (*self.context).nb_streams as usize)
                 .iter().map(|stream| Stream::from_stream(*stream)).collect();
-            self.eof = false;
+            self.read_error = false;
+            self.serial = 0;
             Ok(())
         }
     }
@@ -238,16 +239,17 @@ impl Input {
     pub fn read_packet(&mut self) -> Result<Packet, Error> {
         let mut packet = Packet::new(self.serial, self.id);
         if let Err(error) = packet.read_from(self.context) {
-            if error.is_eof() {
-                self.restart()?;
-                self.eof = true;
-            }
+            self.restart()?;
+            self.read_error = true;
             return Err(error);
         }
         Ok(packet)
     }
 
     pub fn seek(&mut self, min: f64, max: f64, stream_index: Option<i32>) -> Result<(), Error> {
+        if self.read_error {
+            self.restart()?;
+        }
         let (min_ts, max_ts, index) = stream_index.and_then(|index| {
             let base = self.streams[index as usize].timebase;
             Some(((min / base) as i64, (max / base) as i64, index))
@@ -264,7 +266,7 @@ impl Input {
             if result < 0 {
                 return Err(Error::from_code(result));
             }
-            self.eof = false;
+            self.read_error = false;
             self.serial += 1;
             Ok(())
         }
