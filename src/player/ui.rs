@@ -1,20 +1,14 @@
-use crate::gs::nvg;
-use crate::gs::nvg::{Color, Image, NvgContext, Point, Shape, Text, TextHorizontalAlignment, TextVerticalAlignment};
+use crate::gs::nvg::{Color, Image, NvgContext, Shape, Text};
 use crate::gs::window::Window;
 use crate::player::decoder::DecodeWorker;
 use crate::player::input::InputWorker;
 use crate::player::surface::VideoSurface;
 use glfw::{Action, Key, MouseButton, WindowEvent};
-use mlua::prelude::LuaTable;
-use mlua::{AnyUserData, AsChunk, FromLua, Function, IntoLua, Lua, Table, UserData, UserDataMethods, Value};
-use std::cell::{Ref, RefCell};
+use mlua::{AnyUserData, AsChunk, Function, IntoLua, Lua, Table, UserData, UserDataFields, UserDataMethods, Value};
+use std::cell::RefCell;
 use std::rc::Rc;
-use json::value;
 use crate::ffmpeg::input::Input;
 use crate::player::player::VideoPlayer;
-
-pub type ComponentId = usize;
-pub type GroupWeight = f32;
 
 pub enum InputEvent {
     MouseMoved((f32, f32), (f32, f32)),
@@ -22,494 +16,14 @@ pub enum InputEvent {
     Key(Key, Action)
 }
 
-pub enum ComponentBody {
-    Empty,
-    Root {
-        children: Vec<ComponentId>,
-    },
-    Label {
-        text: Text,
-        color: Color,
-        alignment: (TextHorizontalAlignment, TextVerticalAlignment),
-    },
-    Rect {
-        color: Color,
-    },
-    Image(Image),
-    ToggleButton {
-        body: Option<ComponentId>,
-        state: bool,
-        pressed: Option<()>
-    },
-    VideoSurface {
-        surface: Rc<RefCell<VideoSurface>>,
-        image: Option<Image>
-    },
-    TextInput {
-        text: Text,
-        begin_index: Option<usize>,
-        end_index: Option<usize>,
-        enter_pressed: bool,
-    },
-    Slider {
-        percent: f32,
-        target: Option<f32>,
-        foreground: Color,
-        background: Color,
-    },
-    VerticalGroup {
-        children: Vec<(GroupWeight, Option<ComponentId>)>
-    },
-    HorizontalGroup {
-        children: Vec<(GroupWeight, Option<ComponentId>)>
-    },
-    Pane {
-        children: Vec<ComponentId>,
-    }
-}
-
-pub enum PreferredSize {
-    Auto,
-    Fixed(f32),
-    PercentParent(f32)
-}
-
-pub struct Style {
-    pub preferred_size: (PreferredSize, PreferredSize),
-    pub preferred_offset: (PreferredSize, PreferredSize),
-    pub foreground_color: Option<Color>,
-    pub background_color: Option<Color>,
-}
-
-
-pub struct Component {
-    pub width: f32,
-    pub height: f32,
-    pub x: f32,
-    pub y: f32,
-    pub preferred_width: Option<f32>,
-    pub preferred_height: Option<f32>,
-    pub padding: f32,
-    pub visible: bool,
-    pub body: ComponentBody,
-}
-
-impl Component {
-
-    pub fn new() -> Self {
-        Self {
-            width: 0.0,
-            height: 0.0,
-            x: 0.0,
-            y: 0.0,
-            padding: 0.0,
-            preferred_width: None,
-            preferred_height: None,
-            visible: true,
-            body: ComponentBody::Empty,
-        }
-    }
-
-    pub fn with_preferred_size(mut self, width: Option<f32>, height: Option<f32>) -> Self {
-        self.preferred_width = width;
-        self.preferred_height = height;
-        self
-    }
-
-    pub fn with_padding(mut self, padding: f32) -> Self {
-        self.padding = padding;
-        self
-    }
-
-    pub fn image(nvg: &mut NvgContext, path: &str) -> Option<Self> {
-        nvg.create_image(path).map(|image| {
-            let mut comp = Self::new();
-            comp.body = ComponentBody::Image(image);
-            comp
-        })
-    }
-
-    pub fn toggle_button(body: ComponentId) -> Self {
-        let mut comp = Self::new();
-        comp.body = ComponentBody::ToggleButton { body: Some(body), state: false, pressed: None };
-        comp
-    }
-
-    pub fn hgroup(mut children: Vec<(GroupWeight, Option<ComponentId>)>) -> Self {
-        let mut comp = Self::new();
-        let sum = children.iter().map(|(w, _)| w).sum::<f32>();
-        children.iter_mut().for_each(|(w, _)| *w /= sum);
-        comp.body = ComponentBody::HorizontalGroup { children };
-        comp
-    }
-
-    pub fn vgroup(mut children: Vec<(GroupWeight, Option<ComponentId>)>) -> Self {
-        let mut comp = Self::new();
-        let sum = children.iter().map(|(w, _)| w).sum::<f32>();
-        children.iter_mut().for_each(|(w, _)| *w /= sum);
-        comp.body = ComponentBody::VerticalGroup { children };
-        comp
-    }
-
-    pub fn slider(foreground: Color, background: Color) -> Self {
-        let mut comp = Self::new();
-        comp.body = ComponentBody::Slider { percent: 0.0, target: None, foreground, background };
-        comp
-    }
-
-    pub fn video_surface(surface: Rc<RefCell<VideoSurface>>) -> Self {
-        let mut comp = Self::new();
-        comp.body = ComponentBody::VideoSurface { surface, image: None };
-        comp
-    }
-
-    pub fn pane(children: Vec<ComponentId>) -> Self {
-        let mut comp = Self::new();
-        comp.body = ComponentBody::Pane { children };
-        comp
-    }
-
-    pub fn root(children: Vec<ComponentId>) -> Self {
-        let mut comp = Self::new();
-        comp.body = ComponentBody::Root { children };
-        comp
-    }
-
-    pub fn label(nvg: &mut NvgContext, color: Color, alignment: (TextHorizontalAlignment, TextVerticalAlignment)) -> Self {
-        let mut comp = Self::new();
-        comp.body = ComponentBody::Label {
-            text: nvg.text("", "default", 13.0), 
-            color, alignment
-        };
-        comp
-    }
-
-    pub fn rect(color: Color) -> Self {
-        let mut comp = Self::new();
-        comp.body = ComponentBody::Rect { color };
-        comp
-    }
-
-    pub fn bounds_rect(&self) -> Shape {
-        let w = self.preferred_width.unwrap_or(self.width);
-        let h = self.preferred_height.unwrap_or(self.height);
-        Shape::Rect(self.x, self.y, w, h).with_padding(self.padding, true)
-    }
-
-    pub fn update(&mut self, manager: &mut ComponentManager, context: &mut nvg::NvgContext) {
-
-    }
-
-    pub fn handle_event(&mut self, event: InputEvent) {
-        let (x0, y, w, h) = self.bounds_rect().bounds();
-        match &mut self.body {
-            ComponentBody::ToggleButton { state, pressed, .. } => {
-                if let InputEvent::MouseButton(MouseButton::Button1, Action::Release, _) = event {
-                    *state = !*state;
-                    *pressed = Some(());
-                }
-            }
-            ComponentBody::Slider { percent, target, .. } => {
-                if let InputEvent::MouseButton(MouseButton::Button1, Action::Release, (x, y)) = event {
-                    *target = Some((x - x0) / w);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    pub fn add_children(&mut self, id: Option<ComponentId>, weight: GroupWeight) {
-        match &mut self.body {
-            ComponentBody::HorizontalGroup { children } | ComponentBody::VerticalGroup { children } => {
-                children.push((weight, id));
-            }
-            _ => panic!("Invalid operation!")
-        }
-    }
-
-}
-
-pub struct ComponentManager {
-    components: Vec<Option<Component>>,
-    free: Vec<ComponentId>,
-    focused: Option<ComponentId>,
-    root: Option<ComponentId>,
-
-    mouse_pos: (f32, f32),
-}
-
-impl ComponentManager {
-    pub fn new() -> ComponentManager {
-        ComponentManager {
-            components: Vec::new(),
-            free: Vec::new(),
-            focused: None,
-            root: None,
-            mouse_pos: (0.0, 0.0),
-        }
-    }
-
-    pub fn intersecting_child(&self, x: f32, y: f32, parent: Option<ComponentId>) -> Option<ComponentId> {
-        let child = if let Some(parent) = parent.or(self.root).and_then(|id| self.get(id)) {
-            match &parent.body {
-                ComponentBody::HorizontalGroup { children } | ComponentBody::VerticalGroup { children } => {
-                    children.iter().find(|(_, id)| {
-                        if let Some(child) = id.and_then(|id| self.get(id)) {
-                            if child.bounds_rect().intersects(Point::new(x, y)) && child.visible {
-                                return true;
-                            }
-                        }
-                        false
-                    }).map(|(_, id)| id.unwrap())
-                }
-                ComponentBody::Pane { children } | ComponentBody::Root { children } => {
-                    children.iter().rev().find(|id| {
-                        if let Some(child) = self.get(**id) {
-                            if child.bounds_rect().intersects(Point::new(x, y)) && child.visible {
-                                return true;
-                            }
-                        }
-                        false
-                    }).map(|id| *id)
-                }
-                _ => None
-            }
-        } else {
-            None
-        };
-
-        if child.is_none() {
-            return None
-        }
-
-        if let Some(id) = self.intersecting_child(x, y, child) {
-            Some(id)
-        } else {
-            child
-        }
-    }
-
-    pub fn remove(&mut self, id: ComponentId) -> Option<Component> {
-        let option = self.components.get_mut(id);
-        if option.is_none() {
-            return None;
-        }
-        let component = option.unwrap();
-        if component.is_some() {
-            self.free.push(id);
-            return component.take();
-        }
-        None
-    }
-
-    pub fn new_pane(&mut self, children: Vec<ComponentId>) -> ComponentId {
-        self.push(Component::pane(children))
-    }
-
-    pub fn push(&mut self, component: Component) -> ComponentId {
-        if let Some(id) = self.free.pop() {
-            self.components[id] = Some(component);
-            id
-        } else {
-            self.components.push(Some(component));
-            self.components.len() - 1
-        }
-    }
-
-    pub fn get_mut_body(&mut self, id: ComponentId) -> Option<&mut ComponentBody> {
-        self.components.get_mut(id).and_then(Option::as_mut).map(|c| &mut c.body)
-    }
-
-    pub fn get_mut(&mut self, id: ComponentId) -> Option<&mut Component> {
-        self.components.get_mut(id).and_then(Option::as_mut)
-    }
-
-    pub fn get(&self, id: ComponentId) -> Option<&Component> {
-        self.components.get(id).and_then(Option::as_ref)
-    }
-
-    pub fn render(&mut self, id: ComponentId, renderer: &mut nvg::NvgContext) {
-        let mut comp = match self.components[id].take_if(|comp| comp.visible) {
-            Some(comp) => comp,
-            None => return
-        };
-        let rect = comp.bounds_rect();
-        let (mut x, mut y, w, h) = rect.bounds();
-        match &mut comp.body {
-            ComponentBody::Empty => {}
-            ComponentBody::Root { children } => {
-                for child in children {
-                    if let Some(child) = self.get_mut(*child) {
-                        child.x = x;
-                        child.y = y;
-                        child.width = child.preferred_width.unwrap_or(w);
-                        child.height = child.preferred_height.unwrap_or(h);
-                    }
-                    self.render(*child, renderer);
-                }
-            },
-            ComponentBody::Pane { children } => {
-                for child in children {
-                    self.render(*child, renderer);
-                }
-            }
-            ComponentBody::Label { text, color, alignment: (horizontal, vertial) } => {
-                renderer.begin_path();
-                renderer.fit_text(text, w, h);
-                renderer.fill_color(*color);
-                renderer.draw_text_inside(text, rect, *horizontal, *vertial);
-            }
-            ComponentBody::Rect { color } => {
-                renderer.begin_path();
-                renderer.draw_shape(Shape::Rect(x, y, w, h));
-                renderer.fill_color(*color);
-                renderer.fill();
-            }
-            ComponentBody::Slider { percent, target, foreground, background } => {
-                renderer.begin_path();
-                renderer.draw_shape(Shape::Rect(x, y, w, h));
-                renderer.fill_color(*background);
-                renderer.fill();
-
-                let w = w * target.unwrap_or(*percent);
-                renderer.begin_path();
-                renderer.draw_shape(Shape::Rect(x, y, w, h));
-                renderer.fill_color(*foreground);
-                renderer.fill();
-            }
-            ComponentBody::Image(image) => {
-                renderer.begin_path();
-                let (pw, ph) = image.size_conserve_aspect_ratio(w, h);
-                let ox = (w - pw) / 2.0;
-                let oy = (h - ph) / 2.0;
-                let rect = Shape::Rect(x + ox, y + oy, pw, ph);
-                let paint = renderer.image_paint(image, rect, 1.0);
-                renderer.draw_shape(rect);
-                renderer.fill_paint(paint);
-                renderer.fill();
-            }
-            ComponentBody::ToggleButton { body, .. } => {
-                if let Some(body) = body.and_then(|id| self.get_mut(id)) {
-                    body.x = x;
-                    body.y = y;
-                    body.width = w;
-                    body.height = h;
-                }
-                if let Some(id) = body {
-                    self.render(*id, renderer);
-                }
-            }
-
-            ComponentBody::VideoSurface { surface, image } => {
-                let mut surface = surface.borrow_mut();
-                surface.update();
-                if let Some((_, _)) = surface.size_update.take() {
-                    if let Some(image) = image.take() {
-                        renderer.delete_image(image);
-                    }
-                    *image = renderer.create_texture_image(&surface.output_texture);
-                }
-                if let Some(image) = image {
-                    renderer.begin_path();
-                    let (pw, ph) = image.size_conserve_aspect_ratio(w, h);
-                    let ox = (w - pw) / 2.0;
-                    let oy = (h - ph) / 2.0;
-                    let rect = Shape::Rect(x + ox, y + oy, pw, ph);
-                    let paint = renderer.image_paint(image, rect, 1.0);
-                    renderer.draw_shape(rect);
-                    renderer.fill_paint(paint);
-                    renderer.fill();
-                }
-            }
-
-            ComponentBody::VerticalGroup { children } => {
-                for (weight, id) in children {
-                    let h = h * *weight;
-                    if let Some(id) = id {
-                        let comp = self.get_mut(*id);
-                        if let Some(comp) = comp {
-                            comp.x = x;
-                            comp.y = y;
-                            comp.width = comp.preferred_width.unwrap_or(w);
-                            comp.height = comp.preferred_height.unwrap_or(h);
-                        }
-                        self.render(*id, renderer);
-                    }
-                    y += h;
-                }
-            }
-            ComponentBody::HorizontalGroup { children } => {
-                for (weight, id) in children {
-                    let w = w * *weight;
-                    if let Some(id) = id {
-                        let comp = self.get_mut(*id);
-                        if let Some(comp) = comp {
-                            comp.x = x;
-                            comp.y = y;
-                            comp.width = comp.preferred_width.unwrap_or(w);
-                            comp.height = comp.preferred_height.unwrap_or(h);
-                        }
-                        self.render(*id, renderer);
-                    }
-                    x += w;
-                }
-            }
-            _ => unimplemented!()
-        }
-        self.components[id] = Some(comp);
-    }
-
-    pub fn set_root(&mut self, root: ComponentId) {
-        self.root = Some(root);
-    }
-
-    pub fn render_root(&mut self, renderer: &mut nvg::NvgContext) {
-        if let Some(root) = self.root {
-            if let Some(root) = self.get_mut(root) {
-                root.x = 0.0;
-                root.y = 0.0;
-                root.width = renderer.width(None);
-                root.height = renderer.height(None);
-            }
-            self.render(root, renderer);
-        }
-    }
-
-    pub fn handle_event(&mut self, event: WindowEvent, window: &Window) {
-        match event {
-            WindowEvent::Key(key, _, action, _) => {
-                if let Some(focused) = self.focused.and_then(|id| self.get_mut(id)) {
-                    if focused.visible {
-                        focused.handle_event(InputEvent::Key(key, action));
-                    }
-                }
-            }
-            WindowEvent::CursorPos(x, y) => {
-                let y = window.get_framebuffer_size().1 as f64 - y;
-                let (lx, ly) = self.mouse_pos;
-                self.mouse_pos = (x as f32, y as f32);
-                if let Some(child) = self.intersecting_child(x as f32, y as f32, None)
-                    .and_then(|id| self.get_mut(id)) {
-                    child.handle_event(InputEvent::MouseMoved((lx, ly), (x as f32, y as f32)));
-                }
-            }
-            WindowEvent::MouseButton(button, action, _) => {
-                let (x, y) = self.mouse_pos;
-                if let Some((id, child)) = self.intersecting_child(x, y, None)
-                    .and_then(|id| self.get_mut(id).map(|comp| (id, comp))) {
-                    child.handle_event(InputEvent::MouseButton(button, action, (x, y)));
-                    self.focused = Some(id);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub enum RenderCommand {
     ShapeColor(Shape, Color),
+    VideoSurface(AnyUserData, Shape, Option<Image>),
+    Indirect(Table, Option<Box<RenderCommand>>)
 }
+
+impl UserData for RenderCommand {}
 
 impl UserData for VideoSurface {}
 impl UserData for InputWorker {}
@@ -525,13 +39,72 @@ impl UserData for Text {
 }
 
 struct UIRenderContext {
-    list: Vec<RenderCommand>,
-    nvg: Rc<RefCell<NvgContext>>
+    render_commands: Vec<RenderCommand>,
+    nvg: Rc<RefCell<NvgContext>>,
+    frame_buffer_size: (f32, f32)
 }
 
 impl UIRenderContext {
     fn new(nvg: Rc<RefCell<NvgContext>>) -> Self {
-        Self { list: Vec::new(), nvg }
+        let size = nvg.borrow().relative(1.0, 1.0);
+        Self { render_commands: Vec::new(), nvg, frame_buffer_size: size }
+    }
+
+    pub fn render(&mut self) -> Result<(), mlua::Error> {
+        let mut nvg = self.nvg.borrow_mut();
+        nvg.begin_frame(self.frame_buffer_size);
+        for cmd in self.render_commands.iter_mut() {
+            Self::render_command(cmd, &mut *nvg)?
+        }
+        nvg.end_frame();
+        Ok(())
+    }
+
+    pub fn render_command(command: &mut RenderCommand, nvg: &mut NvgContext) -> Result<(), mlua::Error> {
+        match command {
+            RenderCommand::ShapeColor(shape, color) => {
+                nvg.begin_path();
+                nvg.draw_shape(*shape);
+                nvg.fill_color(*color);
+                nvg.fill();
+            }
+            RenderCommand::VideoSurface(surface, shape, image) => {
+                let mut surface = surface.borrow_mut::<VideoSurface>()?;
+                surface.update();
+                if let Some((_, image)) = surface.size_update.take().zip(image.take()) {
+                    nvg.delete_image(image)
+                }
+                if image.is_none() {
+                    *image = nvg.create_texture_image(&surface.output_texture)
+                }
+                if let Some(image) = image {
+                    nvg.begin_path();
+                    let (x, y, w, h) = shape.bounds();
+                    let (pw, ph) = image.size_conserve_aspect_ratio(w, h);
+                    let (ox, oy) = ((w - pw) / 2.0, (h - ph) / 2.0);
+                    let shape = shape.scale_xy(pw / w, ph / h, false).translate(ox, oy);
+                    nvg.begin_path();
+                    nvg.draw_shape(shape);
+                    let paint = nvg.image_paint(image, shape, 1.0);
+                    nvg.fill_paint(paint);
+                    nvg.fill();
+                }
+            }
+            RenderCommand::Indirect(table, command) => {
+                if table.get::<bool>("dirty")? {
+                    table.set("dirty", false)?;
+                    command.take();
+                }
+                if command.is_none() {
+                    let cmd = table.clone().try_into()?;
+                    *command = Some(Box::new(cmd));
+                }
+                if let Some(command) = command {
+                    Self::render_command(&mut *command, nvg)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -576,6 +149,15 @@ impl TryFrom<Table> for RenderCommand {
                 let color: Color = value.get::<Table>("color")?.try_into()?;
                 Ok(RenderCommand::ShapeColor(shape, color))
             }
+            "videoSurface" => {
+                let surface: AnyUserData = value.get::<AnyUserData>("surface")?;
+                let shape: Shape = value.get::<Table>("shape")?.try_into()?;
+                Ok(RenderCommand::VideoSurface(surface, shape, None))
+            }
+            "indirect" => {
+                let command = value.get::<Table>("command")?;
+                Ok(RenderCommand::Indirect(command, None))
+            }
             _ => Err(Self::Error::RuntimeError(format!("Unknown shape: {}", type_))),
         }
     }
@@ -585,12 +167,12 @@ impl UserData for UIRenderContext {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method_mut("push", |_, this, (table): (Table)| {
             let command: RenderCommand = table.try_into()?;
-            this.list.push(command);
+            this.render_commands.push(command);
             Ok(())
         });
         methods.add_method("size", |lua, this, ()| {
             let table = lua.create_table()?;
-            let (w, h) = this.nvg.borrow().relative(1.0, 1.0);
+            let (w, h) = this.frame_buffer_size;
             table.set("w", w)?;
             table.set("h", h)?;
             Ok(table)
@@ -602,6 +184,18 @@ impl UserData for UIRenderContext {
         methods.add_method_mut("newVideoSurface", |_, this, (): ()| {
             Ok(VideoSurface::new())
         });
+        methods.add_method("newVideoPlayer", |lua, this, (path, surface): (String, AnyUserData)| {
+            let mut surface = surface.borrow_mut::<VideoSurface>()?;
+            let table = lua.create_table()?;
+            let mut input_worker = InputWorker::new();
+            let mut decode_worker = DecodeWorker::new();
+            let input = Input::open(&path, &[]).unwrap();
+            let player = VideoPlayer::new(input, Some(&mut *surface), &mut decode_worker, &mut input_worker).unwrap();
+            table.set("input", input_worker)?;
+            table.set("decode", decode_worker)?;
+            table.set("player", player)?;
+            return Ok(table);
+        })
     }
 }
 
@@ -610,23 +204,29 @@ impl IntoLua for InputEvent {
         let table = lua.create_table()?;
         match self {
             InputEvent::Key(key, action) => {
-                table.set(1, "key")?;
-                table.set(2, key as i32)?;
-                table.set(3, action as i32)?;
+                table.set("type", "key")?;
+                table.set("key", key as i32)?;
+                table.set("action", action as i32)?;
             }
             InputEvent::MouseMoved((x0, y0), (x, y)) => {
-                table.set(1, "mouseMove")?;
-                table.set(2, x0 as i32)?;
-                table.set(3, y0 as i32)?;
-                table.set(4, x as i32)?;
-                table.set(5, y as i32)?;
+                table.set("type", "mouseMoved")?;
+                let from = lua.create_table()?;
+                from.set("x", x0)?;
+                from.set("y", y0)?;
+                let to = lua.create_table()?;
+                to.set("x", x)?;
+                to.set("y", y)?;
+                table.set("from", from)?;
+                table.set("to", to)?;
             }
             InputEvent::MouseButton(button, action, (x0, y0)) => {
-                table.set(1, "mouseButton")?;
-                table.set(2, button as i32)?;
-                table.set(3, action as i32)?;
-                table.set(4, x0 as i32)?;
-                table.set(5, y0 as i32)?;
+                let pos = lua.create_table()?;
+                pos.set("x", x0)?;
+                pos.set("y", y0)?;
+                table.set("type", "mouseButton")?;
+                table.set("button", button as i32)?;
+                table.set("action", action as i32)?;
+                table.set("pos", pos)?;
             }
         }
         Ok(Value::Table(table))
@@ -673,15 +273,16 @@ impl UIManager {
 
     pub fn render(&self, width: f32, height: f32) -> Result<(), mlua::Error> {
         let globals = self.lua.globals();
-        let ui = globals.get::<AnyUserData>("ui")?.borrow::<UIRenderContext>()?;
-
-        let mut nvg = ui.nvg.borrow_mut();
-        nvg.set_size((width, height));
-        drop(nvg);
-        drop(ui);
+        let size = self.lua.create_table()?;
+        size.set("w", width)?;
+        size.set("h", height)?;
+        globals.set("size", size)?;
         if globals.get::<bool>("dirty")? {
             globals.set("dirty", false)?;
             if let Some(render) = &self.render_function {
+                let mut ui = globals.get::<AnyUserData>("ui")?.borrow_mut::<UIRenderContext>()?;
+                ui.render_commands.clear();
+                drop(ui); // Stop the damn thing from whining. I mean why the hell can't you have more than one mut borrows here?
                 render.call::<()>(())?;
             }
         }
@@ -689,22 +290,9 @@ impl UIManager {
             update.call::<()>(())?;
         }
 
-        let ui = globals.get::<AnyUserData>("ui")?.borrow::<UIRenderContext>()?;
-        let mut nvg = ui.nvg.borrow_mut();
-        nvg.begin_frame((width, height));
-
-        for cmd in ui.list.iter() {
-            match *cmd {
-                RenderCommand::ShapeColor(shape, color) => {
-                    nvg.begin_path();
-                    nvg.draw_shape(shape);
-                    nvg.fill_color(color);
-                    nvg.fill();
-                }
-            }
-        }
-
-        nvg.end_frame();
+        let mut ui = globals.get::<AnyUserData>("ui")?.borrow_mut::<UIRenderContext>()?;
+        ui.frame_buffer_size = (width, height);
+        ui.render()?;
         Ok(())
     }
 
@@ -716,13 +304,16 @@ impl UIManager {
                 None
             }
             WindowEvent::CursorPos(x, y) => {
-                let to = (x as f32, y as f32);
+                let to = (x as f32, self.window_size.1 - y as f32);
                 let from = self.mouse_position;
                 self.mouse_position = to;
                 Some(InputEvent::MouseMoved(from, to))
             }
             WindowEvent::Key(key, _, action, _) => {
                 Some(InputEvent::Key(key, action))
+            }
+            WindowEvent::MouseButton(button, action, _) => {
+                Some(InputEvent::MouseButton(button, action, self.mouse_position))
             }
             _ => None
         };

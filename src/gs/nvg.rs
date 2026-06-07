@@ -319,7 +319,7 @@ impl Text {
 
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Image {
     id: c_int,
     pub width: u32,
@@ -433,6 +433,7 @@ impl NvgContext {
     pub fn begin_frame(&mut self, size: (f32, f32)) {
         unsafe {
             nvgBeginFrame(self.context, size.0, size.1, 1.0);
+            self.size = size;
         }
     }
 

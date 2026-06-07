@@ -2,20 +2,13 @@ mod ffmpeg;
 pub mod gs;
 pub mod player;
 
-use crate::ffmpeg::input::Input;
 use crate::gs::gl::clear_current_buffer_color;
-use crate::gs::nvg::{Color, NvgContext, TextHorizontalAlignment, TextVerticalAlignment};
+use crate::gs::nvg::NvgContext;
 use crate::gs::window::{Window, WindowHandler};
-use crate::player::decoder::DecodeWorker;
-use crate::player::input::InputWorker;
-use crate::player::player::VideoPlayer;
-use crate::player::surface::VideoSurface;
-use crate::player::ui::{Component, ComponentBody, ComponentId, ComponentManager, UIManager};
-use glfw::{Action, Key, WindowEvent};
-use mlua::{AnyUserData, Lua, Value};
+use glfw::WindowEvent;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::Ordering;
+use crate::player::ui::UIManager;
 
 struct App {
     ui: UIManager
