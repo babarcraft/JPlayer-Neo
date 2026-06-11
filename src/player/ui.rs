@@ -1,27 +1,33 @@
-use crate::gs::nvg::{Color, Image, NvgContext, Shape, Text};
+use crate::gs::nvg::{Color, Image, NvgInstance, Shape, Text, TextFitType, TextOld};
 use crate::gs::window::Window;
 use crate::player::decoder::DecodeWorker;
 use crate::player::input::InputWorker;
 use crate::player::surface::VideoSurface;
 use glfw::{Action, Key, MouseButton, WindowEvent};
-use mlua::{AnyUserData, AsChunk, Function, IntoLua, IntoLuaMulti, Lua, MultiValue, Table, UserData, UserDataFields, UserDataMethods, Value};
-use std::cell::RefCell;
+use mlua::{AnyUserData, AsChunk, Function, IntoLua, IntoLuaMulti, LightUserData, Lua, MultiValue, Table, UserData, UserDataFields, UserDataMethods, Value};
+use std::cell::{Cell, RefCell, RefMut};
+use std::ops::Deref;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
+use ffmpeg_sys_next::MQ_PRIO_MAX;
+use mlua::prelude::LuaValue;
 use crate::ffmpeg::input::Input;
 use crate::player::player::VideoPlayer;
 
 pub enum InputEvent {
     MouseMoved((f32, f32), (f32, f32)),
     MouseButton(MouseButton, Action, (f32, f32)),
-    Key(Key, Action)
+    Key(Key, Action),
+    Char(char),
 }
 
 #[derive(Clone)]
 pub enum RenderCommand {
-    ShapeColor(Shape, Color),
+    ShapeFillColor(Shape, Color),
+    ShapeStrokeColor(Shape, f32, Color),
     VideoSurface(AnyUserData, Shape, Option<Image>),
     TextFill(AnyUserData, Color),
-    Indirect(Table, Box<Option<RenderCommand>>)
+    Indirect(Rc<RefCell<RenderCommand>>),
 }
 
 impl UserData for RenderCommand {}
@@ -50,7 +56,146 @@ impl UserData for VideoPlayer {
     }
 
 }
+
+impl Into<&str> for TextFitType {
+    fn into(self) -> &'static str {
+        match self {
+            TextFitType::Scale => "scale",
+            TextFitType::Range => "range",
+            TextFitType::RangeAndScale => "rangeAndScale",
+        }
+    }
+}
+
+impl IntoLua for TextFitType {
+    fn into_lua(self, lua: &Lua) -> mlua::Result<Value> {
+        let str: &str = self.into();
+        Ok(Value::String(lua.create_string(str)?))
+    }
+}
+
 impl UserData for Text {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("offset", |lua, this| {
+            Ok(this.get_offset())
+        });
+        fields.add_field_method_set("offset", |_, this, offset: Value| {
+            this.set_offset(offset.as_usize().unwrap_or(0));
+            Ok(())
+        });
+        fields.add_field_method_get("pos", |lua, this| {
+            let (x, y) = this.get_pos();
+            Ok(lua.create_table_from([
+                ("x", x),
+                ("y", y),
+            ])?)
+        });
+        fields.add_field_method_set("pos", |_, this, table: Table| {
+            this.set_pos((table.get("x")?, table.get("y")?));
+            Ok(())
+        });
+        fields.add_field_method_set("size", |_, this, value: Value| {
+            let size = if let Some(table) = value.as_table() {
+                Some((table.get("w")?, table.get("h")?))
+            } else {
+                None
+            };
+            this.set_fit_size(size);
+            Ok(())
+        });
+        fields.add_field_method_get("size", |lua, this| {
+            let size = this.get_fit_size();
+            let out = if let Some((w, h)) = size {
+                Value::Table(lua.create_table_from([
+                    ("w", w),
+                    ("h", h),
+                ])?)
+            } else {
+                Value::Nil
+            };
+            Ok(out)
+        });
+        fields.add_field_method_get("len", |_, this| {
+            Ok(this.len())
+        });
+        fields.add_field_method_get("text", |lua, this| {
+            Ok(lua.create_string(this.get_text())?)
+        });
+        fields.add_field_method_set("text", |_, this, string: mlua::String| {
+            this.set_text(string.to_str()?.as_ref());
+            Ok(())
+        });
+        fields.add_field_method_set("font", |_, this, table: Table| {
+            let name: mlua::String = table.get("name")?;
+            let font_size: f32 = table.get("size")?;
+            this.set_font((name.to_str()?.as_ref(), font_size));
+            Ok(())
+        });
+        fields.add_field_method_get("fitType", |lua, this| {
+            let str = match this.get_fit_type() {
+                TextFitType::Scale => "scale",
+                TextFitType::Range => "range",
+                TextFitType::RangeAndScale => "rangeAndScale",
+            };
+            Ok(lua.create_string(str)?)
+        });
+        fields.add_field_method_set("fitType", |lua, this, ty: mlua::String| {
+            let str = ty.to_str()?;
+            let ty = match str.as_ref() {
+                "scale" => TextFitType::Scale,
+                "range" => TextFitType::Range,
+                "rangeAndScale" => TextFitType::RangeAndScale,
+                _ => return Err(mlua::Error::RuntimeError(format!("Invalid text fit type: {}", str))),
+            };
+            this.set_fit_type(ty);
+            Ok(())
+        })
+    }
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut("clear", |_, this, ()| {
+            this.with_string(|dest| {
+                dest.clear();
+            });
+            this.set_offset(0);
+            Ok(())
+        });
+        methods.add_method("bounds", |lua, this, (begin, end): (Value, Value)| {
+            let begin = begin.as_usize().unwrap_or(0);
+            let end = end.as_usize().unwrap_or(this.len());
+            let (x, y, w, h) = this.range_bounds(Some(begin..end));
+            let (px, ..) = this.get_pos();
+            let x1 = this.display_range_offset().map(|ox| px + x - ox).unwrap_or(x);
+            let table = lua.create_table_from([
+                (1, x1),
+                (2, y),
+                (3, w),
+                (4, h),
+            ])?;
+            Ok(table)
+        });
+        methods.add_method_mut("push", |_, this, string: mlua::String| {
+            let str = string.to_str()?;
+            let offset = this.get_offset();
+            this.with_string(|dest| {
+                dest.insert_str(offset, &str);
+            });
+            this.set_offset(offset + str.len());
+            Ok(())
+        });
+        methods.add_method_mut("pop", |_, this, ()| {
+            let offset = this.get_offset().max(1) - 1;
+            this.with_string(|dest| {
+                if offset < dest.len() {
+                    dest.remove(offset);
+                }
+            });
+            this.set_offset(offset);
+            Ok(())
+        });
+    }
+}
+
+impl UserData for TextOld {
     fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_set("x", |_, this, x: f32| {
             this.x = x;
@@ -70,76 +215,171 @@ impl UserData for Text {
                 if begin.is_none() && end.is_none() {
                     None
                 } else {
-                    let begin = begin.unwrap_or(0);
-                    let end = end.unwrap_or(this.len());
-                    Some(begin..end)
+                    let begin = begin.unwrap_or(0).max(0).min(this.len());
+                    let end = end.unwrap_or(this.len()).max(0).min(this.len());
+                    Some(begin.min(end)..end.max(begin))
                 }
             } else {
                 None
             };
             Ok(())
+        });
+        fields.add_field_method_get("range", |lua, this| {
+            if let Some(range) = this.range.as_ref() {
+                let table = lua.create_table_from([
+                    (1, range.start),
+                    (2, range.end),
+                ])?;
+                return Ok(Value::Table(table));
+            }
+            Ok(Value::Nil)
         })
     }
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("bounds", |lua, this, (begin, end): (Option<usize>, Option<usize>)| {
-            let result: Option<(f32, f32, f32, f32)> = if begin.is_none() && end.is_none() {
-                Some(this.bounds())
+            let result: (f32, f32, f32, f32) = if begin.is_none() && end.is_none() {
+                this.bounds()
             } else {
                 let begin = begin.unwrap_or(0);
                 let end = end.unwrap_or(this.len());
-
                 this.char_range_bounds(begin..end)
             };
 
-            Ok(match result {
-                Some(result) => result.into_lua_multi(lua)?,
-                None => mlua::MultiValue::new()
-            })
+            Ok(Value::Table(lua.create_table_from([
+                (1, result.0),
+                (2, result.1),
+                (3, result.2),
+                (4, result.3),
+            ])?))
         });
-        methods.add_method("boundsRange", |lua, this, (begin, end): (usize, usize)| {
-            if let Some((x, y, w, h)) = this.char_range_bounds(begin..end) {
-                Ok(Value::Table(lua.create_table_from([
-                    (1, Value::Number(x as f64)),
-                    (2, Value::Number(y as f64)),
-                    (3, Value::Number(w as f64)),
-                    (4, Value::Number(h as f64)),
-                ])?))
-            } else {
-                Ok(Value::Nil)
-            }
-        })
+    }
+}
+
+struct Task {
+    last: Option<Instant>,
+    canceled: Rc<RefCell<bool>>,
+    predicate: Function,
+    function: Function,
+}
+
+struct TaskHandle {
+    canceled: Rc<RefCell<bool>>,
+}
+
+impl UserData for TaskHandle {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("canceled", |_, this| Ok(this.canceled.borrow().clone()));
+        fields.add_field_method_set("canceled", |_, this, canceled: bool| {
+            this.canceled.replace(canceled);
+            Ok(())
+        });
+    }
+}
+
+impl Task {
+    fn new(predicate: Function, function: Function) -> Self {
+        let last = Instant::now();
+        Self {
+            last: None,
+            canceled: Rc::new(RefCell::new(false)),
+            predicate,
+            function,
+        }
+    }
+    
+    fn is_canceled(&self) -> bool {
+        *self.canceled.borrow()
+    }
+    
+    fn check(&self) -> Result<bool, mlua::Error> {
+        if self.last.is_none() {
+            return Ok(true)
+        }
+        self.predicate.call(self.last.unwrap().elapsed().as_secs_f64())
+    }
+    
+    fn run(&mut self) -> Result<(), mlua::Error> {
+        self.function.call::<()>(())?;
+        self.last.replace(Instant::now());
+        Ok(())
+    }
+    
+    fn handle(&self) -> TaskHandle {
+        TaskHandle {
+            canceled: self.canceled.clone(),
+        }
     }
 }
 
 struct UIRenderContext {
     render_commands: Vec<RenderCommand>,
-    nvg: Rc<RefCell<NvgContext>>,
-    frame_buffer_size: (f32, f32)
+    nvg: NvgInstance,
+    frame_buffer_size: (f32, f32),
+    
+    tasks: Vec<Task>,
+
+    render_handle: Option<Function>,
+    event_handle: Option<Function>,
+    update_handle: Option<Function>,
+    dirty: bool
 }
 
 impl UIRenderContext {
-    fn new(nvg: Rc<RefCell<NvgContext>>) -> Self {
-        let size = nvg.borrow().relative(1.0, 1.0);
-        Self { render_commands: Vec::new(), nvg, frame_buffer_size: size }
+    fn new(nvg: &NvgInstance) -> Self {
+        let nvg = nvg.clone();
+        let size = nvg.relative(1.0, 1.0);
+        Self {
+            render_commands: Vec::new(),
+            nvg,
+            frame_buffer_size: size,
+            tasks: Vec::new(),
+            render_handle: None,
+            event_handle: None,
+            update_handle: None,
+            dirty: true
+        }
     }
 
     pub fn render(&mut self) -> Result<(), mlua::Error> {
-        let mut nvg = self.nvg.borrow_mut();
+        if let Some((dirty, render_handle)) = Some(&mut self.dirty)
+            .take_if(|d| **d).zip(self.render_handle.as_ref()) {
+            *dirty = false;
+            self.render_commands.clear();
+            render_handle.call::<()>(())?;
+        }
+        if let Some(update_handle) = self.update_handle.as_ref() {
+            update_handle.call::<()>(())?;
+        }
+
+        let nvg = &mut self.nvg;
         nvg.begin_frame(self.frame_buffer_size);
         for cmd in self.render_commands.iter_mut() {
-            Self::render_command(cmd, &mut *nvg)?
+            Self::render_command(cmd, nvg)?
         }
         nvg.end_frame();
+        
+        self.tasks.retain(|t| !t.is_canceled());
+        for task in self.tasks.iter_mut() {
+            if task.check()? { task.run()?; }
+        }
+        
         Ok(())
     }
 
-    pub fn render_command(command: &mut RenderCommand, nvg: &mut NvgContext) -> Result<(), mlua::Error> {
+    pub fn render_command(command: &mut RenderCommand, nvg: &mut NvgInstance) -> Result<(), mlua::Error> {
         match command {
-            RenderCommand::ShapeColor(shape, color) => {
+            RenderCommand::ShapeFillColor(shape, color) => {
                 nvg.begin_path();
                 nvg.draw_shape(*shape);
                 nvg.fill_color(*color);
                 nvg.fill();
+            }
+            RenderCommand::ShapeStrokeColor(shape, width, color) => {
+                nvg.begin_path();
+                nvg.draw_shape(*shape);
+                nvg.stroke_color(*color);
+                nvg.stroke_width(*width);
+                nvg.stroke();
             }
             RenderCommand::VideoSurface(surface, shape, image) => {
                 let mut surface = surface.borrow_mut::<VideoSurface>()?;
@@ -163,25 +403,24 @@ impl UIRenderContext {
                     nvg.fill();
                 }
             }
-            RenderCommand::Indirect(table, command) => {
-                if table.get::<bool>("dirty")? {
-                    table.set("dirty", false)?;
-                    command.take();
-                }
-                if command.is_none() {
-                    let cmd: RenderCommand = table.clone().try_into()?;
-                    *(*command) = Some(cmd);
-                }
-                if let Some(command) = command.as_mut() {
-                    Self::render_command(&mut *command, nvg)?;
-                }
+            RenderCommand::Indirect(command) => {
+                let command = &mut *command.borrow_mut();
+                Self::render_command(command, nvg)?;
             },
             RenderCommand::TextFill(text, color) => {
                 nvg.begin_path();
                 nvg.fill_color(*color);
-                nvg.draw_text(&mut *text.borrow_mut()?);
+                let text = text.borrow_mut::<Text>()?;
+                text.draw(nvg);
                 nvg.fill();
-            }
+            },
+        }
+        Ok(())
+    }
+
+    pub fn handle_event(&mut self, event: InputEvent) -> Result<(), mlua::Error> {
+        if let Some(event_handler) = self.event_handle.as_ref() {
+            event_handler.call::<()>(event)?;
         }
         Ok(())
     }
@@ -221,12 +460,18 @@ impl TryFrom<Table> for RenderCommand {
     type Error = mlua::Error;
 
     fn try_from(value: Table) -> Result<Self, Self::Error> {
-        let type_ = value.get::<mlua::String>(1)?;
+        let type_ = value.get::<mlua::String>("type")?;
         match type_.to_str()?.as_ref() {
-            "shapeColor" => {
+            "shapeFillColor" => {
                 let shape: Shape = value.get::<Table>("shape")?.try_into()?;
                 let color: Color = value.get::<Table>("color")?.try_into()?;
-                Ok(RenderCommand::ShapeColor(shape, color))
+                Ok(RenderCommand::ShapeFillColor(shape, color))
+            }
+            "shapeStrokeColor" => {
+                let shape: Shape = value.get::<Table>("shape")?.try_into()?;
+                let width = value.get("width")?;
+                let color: Color = value.get::<Table>("color")?.try_into()?;
+                Ok(RenderCommand::ShapeStrokeColor(shape, width, color))
             }
             "videoSurface" => {
                 let surface: AnyUserData = value.get::<AnyUserData>("surface")?;
@@ -238,43 +483,120 @@ impl TryFrom<Table> for RenderCommand {
                 let color = value.get::<Table>("color")?.try_into()?;
                 Ok(RenderCommand::TextFill(text, color))
             }
-            "indirect" => {
-                let command = value.get::<Table>("command")?;
-                Ok(RenderCommand::Indirect(command, Box::new(None)))
-            }
             _ => Err(Self::Error::RuntimeError(format!("Unknown shape: {}", type_.to_str()?.as_ref()))),
         }
     }
 }
 
-impl UserData for UIRenderContext {
+struct IndirectCommandHandle {
+    command: Rc<RefCell<RenderCommand>>,
+    command_table: Table
+}
+
+impl IndirectCommandHandle {
+    fn new(command: RenderCommand, current: Table) -> Self {
+        Self { command: Rc::new(RefCell::new(command)), command_table: current }
+    }
+
+    pub fn clone_ref(&self) -> Rc<RefCell<RenderCommand>> {
+        self.command.clone()
+    }
+}
+
+impl UserData for IndirectCommandHandle {
+
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut("update", |_, this, ()| {
+            let current = this.command_table.clone();
+            let command: RenderCommand = current.try_into()?;
+            this.command.replace(command);
+            Ok(())
+        });
+    }
+
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("command", |_, this| {
+            Ok(this.command_table.clone())
+        });
+        fields.add_field_method_set("command", |_, this, command: Table| {
+            this.command_table = command.clone();
+            let command: RenderCommand = command.try_into()?;
+            this.command.replace(command);
+            Ok(())
+        });
+    }
+
+}
+
+#[derive(Copy, Clone)]
+struct UIRenderContextRef(*mut UIRenderContext);
+
+impl UIRenderContextRef {
+    fn new(nvg: &NvgInstance) -> Self {
+        let rc = Box::new(UIRenderContext::new(nvg));
+        UIRenderContextRef(Box::into_raw(rc))
+    }
+
+    fn get(&self) -> &mut UIRenderContext {
+        unsafe { &mut *(self.0) }
+    }
+
+    fn userdata(&self) -> LightUserData {
+        LightUserData(self.0 as *mut _)
+    }
+
+    fn deallocate(&self) {
+        unsafe {
+            drop(Box::from_raw(self.0));
+        }
+    }
+}
+
+impl From<LightUserData> for UIRenderContextRef {
+    fn from(userdata: LightUserData) -> Self {
+        UIRenderContextRef(userdata.0 as *mut _)
+    }
+}
+
+impl UserData for UIRenderContextRef {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method_mut("push", |_, this, (table): (Table)| {
             let command: RenderCommand = table.try_into()?;
-            this.render_commands.push(command);
+            this.get().render_commands.push(command);
             Ok(())
         });
-        methods.add_method("size", |lua, this, ()| {
+        methods.add_method_mut("pushIndirect", |_, this, (table): (Table)| {
+            let handle = IndirectCommandHandle::new(table.clone().try_into()?, table);
+            this.get().render_commands.push(RenderCommand::Indirect(handle.clone_ref()));
+            Ok(handle)
+        });
+        methods.add_method_mut("setDirty", |_, this, (): ()| {
+            this.get().dirty = true;
+            Ok(())
+        });
+        methods.add_method_mut("setRenderHandle", |_, this, (handle): (Function)| {
+            this.get().render_handle = Some(handle);
+            Ok(())
+        });
+        methods.add_method_mut("setEventHandle", |_, this, (handle): (Function)| {
+            this.get().event_handle = Some(handle);
+            Ok(())
+        });
+        methods.add_method_mut("setUpdateHandle", |_, this, (handle): (Function)| {
+            this.get().update_handle = Some(handle);
+            Ok(())
+        });
+        methods.add_method("getSize", |lua, this, ()| {
             let table = lua.create_table()?;
-            let (w, h) = this.frame_buffer_size;
+            let (w, h) = this.get().frame_buffer_size;
             table.set("w", w)?;
             table.set("h", h)?;
             Ok(table)
         });
-        methods.add_method_mut("newText", |_, this, (text, font, size): (mlua::String, mlua::String, f32)| {
-            let text = this.nvg.borrow_mut().text(text.to_str()?.as_ref(), font.to_str()?.as_ref(), size);
+        methods.add_method_mut("newText", |_, this, (init_text, font, size): (mlua::String, mlua::String, f32)| {
+            let mut text = Text::new(&this.get().nvg, (font.to_str()?.as_ref(), size));
+            text.set_text(init_text.to_str()?.as_ref());
             Ok(text)
-        });
-        methods.add_method("setText", |_, this, (text, set): (AnyUserData, mlua::String)| {
-            let mut text = text.borrow_mut::<Text>()?;
-            text.set_str(set.to_str()?.as_ref());
-            this.nvg.borrow_mut().update_text(&mut *text);
-            Ok(())
-        });
-        methods.add_method("fitText", |_, this, (text, width, height): (AnyUserData, Option<f32>, Option<f32>)| {
-            let mut text = text.borrow_mut::<Text>()?;
-            this.nvg.borrow_mut().fit_text(&mut *text, width.unwrap_or(f32::MAX), height.unwrap_or(f32::MAX));
-            Ok(())
         });
         methods.add_method_mut("newVideoSurface", |_, this, (): ()| {
             Ok(VideoSurface::new())
@@ -290,7 +612,13 @@ impl UserData for UIRenderContext {
             table.set("decode", decode_worker)?;
             table.set("player", player)?;
             return Ok(table);
-        })
+        });
+        methods.add_method_mut("addTask", |_, this, (predicate, function): (Function, Function)| {
+            let task = Task::new(predicate, function);
+            let handle = task.handle();
+            this.get().tasks.push(task);
+            Ok(handle)
+        });
     }
 }
 
@@ -323,6 +651,10 @@ impl IntoLua for InputEvent {
                 table.set("action", action as i32)?;
                 table.set("pos", pos)?;
             }
+            InputEvent::Char(c) => {
+                table.set("type", "char")?;
+                table.set("c", c as u32)?;
+            }
         }
         Ok(Value::Table(table))
     }
@@ -332,33 +664,27 @@ pub struct UIManager {
     lua: Lua,
     window_size: (f32, f32),
     mouse_position: (f32, f32),
-    render_function: Option<Function>,
-    update_function: Option<Function>,
-    event_function: Option<Function>,
+    context: UIRenderContextRef,
 }
 
 impl UIManager {
-    pub fn new(nvg: Rc<RefCell<NvgContext>>, window: &Window) -> Self {
+    pub fn new(nvg: &NvgInstance, window: &Window) -> Self {
         let lua = Lua::new();
         let globals = lua.globals();
-        globals.set("ui", UIRenderContext::new(nvg)).unwrap();
+        let context = UIRenderContextRef::new(nvg);
+        globals.set("ui", context.clone()).unwrap();
         globals.set("dirty", true).unwrap();
         let (w, h) = window.get_framebuffer_size();
         Self {
             lua,
-            render_function: None,
-            update_function: None,
-            event_function: None,
+            context,
             window_size: (w as f32, h as f32),
             mouse_position: (0.0, 0.0),
         }
     }
 
     pub fn load_script(&mut self, chunk: impl AsChunk) -> Result<(), mlua::Error> {
-        let table: Table = self.lua.load(chunk).eval()?;
-        self.render_function = Some(table.get("render")?);
-        self.update_function = Some(table.get("update")?);
-        self.event_function = Some(table.get("event")?);
+        self.lua.load(chunk).exec()?;
         Ok(())
     }
 
@@ -368,24 +694,7 @@ impl UIManager {
 
     pub fn render(&self, width: f32, height: f32) -> Result<(), mlua::Error> {
         let globals = self.lua.globals();
-        let size = self.lua.create_table()?;
-        size.set("w", width)?;
-        size.set("h", height)?;
-        globals.set("size", size)?;
-        if globals.get::<bool>("dirty")? {
-            globals.set("dirty", false)?;
-            if let Some(render) = &self.render_function {
-                let mut ui = globals.get::<AnyUserData>("ui")?.borrow_mut::<UIRenderContext>()?;
-                ui.render_commands.clear();
-                drop(ui); // Stop the damn thing from whining. I mean why the hell can't you have more than one mut borrows here?
-                render.call::<()>(())?;
-            }
-        }
-        if let Some(update) = &self.update_function {
-            update.call::<()>(())?;
-        }
-
-        let mut ui = globals.get::<AnyUserData>("ui")?.borrow_mut::<UIRenderContext>()?;
+        let ui = self.context.get();
         ui.frame_buffer_size = (width, height);
         ui.render()?;
         Ok(())
@@ -410,16 +719,27 @@ impl UIManager {
             WindowEvent::MouseButton(button, action, _) => {
                 Some(InputEvent::MouseButton(button, action, self.mouse_position))
             }
+            WindowEvent::Char(c) => {
+                Some(InputEvent::Char(c))
+            }
             _ => None
         };
-        if let Some((on_event, event)) = self.event_function.as_ref().zip(event) {
-            on_event.call::<()>(event)?;
+        let ui = self.context.get();
+        if let Some(event) = event {
+            ui.handle_event(event)?;
         }
         Ok(())
     }
 
     pub fn set_dirty(&self) -> Result<(), mlua::Error> {
-        self.lua.globals().set("dirty", true)?;
+        let ui = self.context.get();
+        ui.dirty = true;
         Ok(())
+    }
+}
+
+impl Drop for UIManager {
+    fn drop(&mut self) {
+        self.context.deallocate()
     }
 }

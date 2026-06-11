@@ -3,10 +3,11 @@ pub mod gs;
 pub mod player;
 
 use crate::gs::gl::clear_current_buffer_color;
-use crate::gs::nvg::NvgContext;
+use crate::gs::nvg::NvgInstance;
 use crate::gs::window::{Window, WindowHandler};
 use glfw::WindowEvent;
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
 use crate::player::ui::UIManager;
 
@@ -16,12 +17,12 @@ struct App {
 
 impl App {
     pub fn new(window: &Window) -> Self {
-        let mut nvg_context = NvgContext::new();
+        let mut nvg_context = NvgInstance::new();
 
         nvg_context.load_font("default", "src/res/def.ttf");
 
-        let mut ui = UIManager::new(Rc::new(RefCell::new(nvg_context)), window);
-        ui.load_script(std::fs::read_to_string("ui.lua").unwrap()).unwrap();
+        let mut ui = UIManager::new(&nvg_context, window);
+        ui.load_script(Path::new("out.lua")).unwrap();
 
         Self {
             ui

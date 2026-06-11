@@ -1,0 +1,14 @@
+{
+  "tstl": {
+    "luaTarget": "5.5"
+  },
+  "include": [
+    "**/*.ts",
+    "**/*.d.ts"
+  ],
+  "compilerOptions": {
+    "target": "ES2019",
+    "lib": ["ES2019"],
+    "module": "commonjs"
+  }
+}
