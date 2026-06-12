@@ -416,7 +416,8 @@ impl InputWorkerContext {
     fn clear_inputs(&mut self) {
         self.inputs.retain(|pair| pair.entries.iter().all(|queue| {
             if let Some(entry) = queue {
-                !entry.queue_view.closed()
+                let closed = entry.queue_view.closed();
+                !closed
             } else {
                 true
             }

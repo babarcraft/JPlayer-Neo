@@ -72,6 +72,7 @@ type MouseMovedEvent = {
     to: Vec2
 }
 
+
 type MouseButtonEvent = {
     type: "mouseButton",
     pos: Vec2,
@@ -85,17 +86,16 @@ type Color = [number, number, number, number];
 
 
 declare interface VideoSurfaceHandle {}
+declare interface InputWorker {}
+declare interface DecodeWorker {}
 
 declare interface VideoPlayerHandle {
-    player: {
-        play(): void;
-        seek(time: number): void;
+    play(): void;
+    seek(time: number): void;
 
-        duration: number;
-        pts: number;
-    };
-
-    lastPts?: number;
+    duration: number;
+    pts: number;
+    volume: number;
 }
 
 type CommandMap = {
@@ -163,9 +163,16 @@ declare interface UI {
 
     newVideoPlayer(
         path: string,
-        surface: VideoSurfaceHandle
+        surface: VideoSurfaceHandle,
+        inputWorker: InputWorker,
+        decodeWorker: DecodeWorker
     ): VideoPlayerHandle;
 
+    newInputWorker(): InputWorker
+    newDecodeWorker(): DecodeWorker
+
+    getClipboard(): string
+    
     getSize(): Size;
 
     setDirty(): void;

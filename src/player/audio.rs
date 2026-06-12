@@ -1,6 +1,7 @@
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
+use bytemuck::Contiguous;
 use cpal::{BufferSize, ChannelCount, Device, Host, SampleFormat, Stream, StreamConfig};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ffmpeg_sys_next::{av_ripemd_init, AVSampleFormat};
@@ -13,6 +14,7 @@ pub struct AudioDevice {
     stream: Stream,
     sender: Sender<DecodeWorkerMessage>,
     playing: Arc<AtomicBool>,
+    pub volume: Arc<AtomicI16>,
     pub ring_buffer: Arc<RwLock<AudioRingBuffer>>,
 }
 
@@ -36,18 +38,26 @@ impl AudioDevice {
         };
 
         let playing = Arc::new(AtomicBool::new(false));
+        let volume = Arc::new(AtomicI16::new(100));
 
         let stream = {
             let ring_buffer = ring_buffer.clone();
             let view = ring_buffer.read().unwrap().view();
             let sender = sender.clone();
             let playing = playing.clone();
+            let volume = volume.clone();
             device.build_output_stream(&config, move |output: &mut [i16], info: &cpal::OutputCallbackInfo| {
                 let playing = playing.load(Ordering::Relaxed);
                 if view.size() < output.len() || !playing {
                     output.fill(0);
                 } else {
                     let read = ring_buffer.write().unwrap().read_to(output);
+                    let volume = volume.load(Ordering::Relaxed) as f32 / 100.0;
+                    for s in output.iter_mut() {
+                        let val = *s as f32;
+                        let out = (val * volume).clamp(i16::MIN as f32, i16::MAX as f32);
+                        *s = out as i16
+                    }
                     output[read..].fill(0);
                 }
 
@@ -64,6 +74,7 @@ impl AudioDevice {
             device,
             playing,
             stream,
+            volume,
             sender,
             ring_buffer
         })

@@ -5,14 +5,15 @@ pub mod player;
 use crate::gs::gl::clear_current_buffer_color;
 use crate::gs::nvg::NvgInstance;
 use crate::gs::window::{Window, WindowHandler};
-use glfw::WindowEvent;
+use glfw::{PWindow, WindowEvent};
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 use crate::player::ui::UIManager;
 
 struct App {
-    ui: UIManager
+    ui: UIManager,
+    handle: Rc<RefCell<PWindow>>
 }
 
 impl App {
@@ -25,19 +26,21 @@ impl App {
         ui.load_script(Path::new("out.lua")).unwrap();
 
         Self {
-            ui
+            ui, 
+            handle: window.handle()
         }
     }
 }
 
 impl WindowHandler for App {
-    fn initialize(&mut self, window: &mut Window) {}
+    fn initialize(&mut self, window: &Window) {}
 
-    fn render(&mut self, dt: f32, window: &mut Window) {
+    fn render(&mut self, dt: f32, window: &Window) {
         clear_current_buffer_color();
 
-        let (w, h) = window.get_framebuffer_size();
-        self.ui.render(w, h).unwrap();
+        let handle = self.handle.borrow();
+        let (w, h) = handle.get_framebuffer_size();
+        self.ui.render(w as f32, h as f32).unwrap();
     }
 
     fn handle_event(&mut self, event: WindowEvent, window: &Window) {

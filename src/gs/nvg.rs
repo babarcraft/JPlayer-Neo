@@ -182,7 +182,6 @@ pub struct Text {
     fit_size: Option<(f32, f32)>,
     fit_type: TextFitType,
     metrics: TextMatrics,
-    align: (TextAlign, TextAlign),
 }
 
 impl Text {
@@ -201,7 +200,6 @@ impl Text {
             pos: (0.0, 0.0),
             fit_size: None,
             fit_type: TextFitType::RangeAndScale,
-            align: (TextAlign::CenterHorizontal, TextAlign::CenterVertical),
         }
     }
 
@@ -264,14 +262,6 @@ impl Text {
         self.fit_type
     }
 
-    pub fn set_align(&mut self, align: (TextAlign, TextAlign)) {
-        self.align = align;
-    }
-
-    pub fn get_align(&self) -> (TextAlign, TextAlign) {
-        self.align
-    }
-
     pub fn set_fit_size(&mut self, size: Option<(f32, f32)>) {
         self.fit_size = size;
         self.update();
@@ -328,6 +318,10 @@ impl Text {
             .zip(glyphs.last())
             .map(|(first, last)| last.maxx - first.minx)
     }
+    
+    fn line_height(&self) -> f32 {
+        self.metrics.line_height.max(self.metrics.ascender + self.metrics.descender)
+    }
 
     fn instance_set_font(&mut self) {
         self.instance.set_font(self.font.0.as_str(), self.font.1);
@@ -343,7 +337,7 @@ impl Text {
                 tw > w
             });
             let height_bigger = h.map(|h| {
-                let th = self.instance.text_metrics().line_height;
+                let th = self.line_height();
                 th > h
             });
             if width_bigger.unwrap_or(false) || height_bigger.unwrap_or(false) {
@@ -356,6 +350,7 @@ impl Text {
                 self.font.1 += 1.0;
             }
         }
+
     }
 
     pub fn display_range_offset(&self) -> Option<f32> {
@@ -366,17 +361,17 @@ impl Text {
         let slice = self.glyphs_slice();
         let (px, py) = self.pos;
         if slice.is_empty() {
-            return (px, py, 0.0, self.metrics.line_height)
+            return (px, py, 0.0, self.line_height());
         }
         if let Some(range) = range {
             let (smin, _) = self.get_glyph(range.start);
             let (_, emax) = self.get_glyph(range.end);
-            (smin, py, emax - smin, self.metrics.line_height)
+            (smin, py, emax - smin, self.line_height())
         } else {
             slice.first().zip(slice.last())
                 .map(|(first, last)| {
-                    (first.minx, py, last.maxx - first.minx, self.metrics.line_height)
-                }).unwrap_or((px, py, 0.0, self.metrics.line_height))
+                    (first.minx, py, last.maxx - first.minx, self.line_height())
+                }).unwrap_or((px, py, 0.0, self.line_height()))
         }
     }
 
@@ -456,21 +451,6 @@ impl Text {
 
 }
 
-#[derive(Clone, Debug)]
-pub struct TextOld {
-    font: String,
-    font_size: f32,
-
-    data: String,
-    glyph_positions: Vec<NVGglyphPosition>,
-    matrics: TextMatrics,
-    dirty: bool,
-    fit: bool,
-    pub range: Option<Range<usize>>,
-    pub(crate) x: f32,
-    pub(crate) y: f32,
-}
-
 #[derive(Copy, Clone, Debug)]
 pub struct TextMatrics {
     ascender: f32,
@@ -482,168 +462,6 @@ impl TextMatrics {
     fn empty() -> TextMatrics {
         TextMatrics { ascender: 0.0, descender: 0.0, line_height: 0.0 }
     }
-}
-
-impl TextOld {
-    
-    pub fn bounds(&self) -> (f32, f32, f32, f32) {
-        if self.glyph_positions.is_empty() {
-            return (self.x, self.y, 0.0, self.matrics.line_height);
-        }
-        let glyphs = if let Some(range) = &self.range {
-            &self.glyph_positions[range.clone()]
-        } else {
-            &self.glyph_positions
-        };
-        let w = glyphs.last()
-            .zip(glyphs.first())
-            .map(|(last, first)| {
-                let min = last.minx.min(first.minx);
-                let max = last.maxx.max(first.maxx);
-                max - min
-            })
-            .unwrap_or(0.0);
-        (self.x, self.y, w, self.matrics.line_height)
-    }
-
-    pub fn bounds_absolute(&self) -> (f32, f32, f32, f32) {
-        let (x, y, w, h) = self.bounds();
-        (x, y, x + w, y + h)
-    }
-
-    pub fn char_bounds(&self, index: usize) -> Option<(f32, f32, f32, f32)> {
-        if index >= self.glyph_positions.len() {
-            return self.glyph_positions.last().map(|glyph| {
-                (self.x + glyph.maxx, self.y, 0.0, self.matrics.line_height)
-            });
-        }
-        let max_index = self.glyph_positions.len().max(1) - 1;
-        let index = index.max(0).min(max_index);
-        self.glyph_positions.get(index.min(max_index)).map(|glyph| {
-            (self.x + glyph.minx, self.y, glyph.maxx - glyph.minx, self.matrics.line_height)
-        })
-    }
-
-    pub fn char_range_bounds(&self, range: Range<usize>) -> (f32, f32, f32, f32) {
-        let x_off = self.range.as_ref()
-            .take_if(|other| other.start <= range.start)
-            .and_then(|range| self.char_bounds(range.start))
-            .map(|(x, ..)| x - self.x)
-            .unwrap_or(0.0);
-        let (x0, y0, xf0, yf0) = self.char_bounds_absolute(range.start);
-        let (x, y, xf, yf) = self.char_bounds_absolute(range.end);
-        let w = xf - x0;
-        let h = yf - y0;
-        (x0 - x_off, y0, w, h)
-    }
-
-    pub fn char_range_bounds_absolute(&self, range: Range<usize>) -> (f32, f32, f32, f32) {
-        let (x, y, w, h) = self.char_range_bounds(range);
-        (x, y, x + w, y + h)
-    }
-
-    pub fn char_bounds_absolute(&self, index: usize) -> (f32, f32, f32, f32) {
-        let (x, y, w, h) = self.char_bounds(index).unwrap_or((self.x, self.y, 0.0, self.matrics.line_height));
-        (x, y, x + w, y + h)
-    }
-
-    pub fn translate(&mut self, ox: f32, oy: f32) {
-        self.x += ox;
-        self.y += oy;
-    }
-
-    pub fn set_position(&mut self, x: f32, y: f32) {
-        self.x = x;
-        self.y = y;
-    }
-    
-    pub fn push_back(&mut self, c: char) {
-        self.data.push(c);
-        self.dirty = true;
-    }
-
-    pub fn insert_at(&mut self, index: usize, c: char) {
-        self.data.insert(index, c);
-        self.dirty = true;
-    }
-
-    pub fn remove_at(&mut self, index: usize) {
-        self.data.remove(index);
-        self.glyph_positions.remove(index);
-        self.dirty = true;
-    }
-
-    pub fn push_str(&mut self, str: &str) {
-        self.data.extend(str.chars());
-        self.dirty = true;
-    }
-
-    pub fn clear(&mut self) {
-        self.data.clear();
-        self.glyph_positions.clear();
-        self.dirty = true;
-    }
-    
-    pub fn pop(&mut self) -> Option<(char, NVGglyphPosition)> {
-        let char = self.data.pop().zip(self.glyph_positions.pop());
-        self.dirty = true;
-        char
-    }
-    
-    pub fn set_str(&mut self, string: &str) {
-        self.data.clear();
-        self.data.extend(string.chars());
-        self.glyph_positions.clear();
-        self.dirty = true;
-    }
-    
-    pub fn as_str(&self) -> &str {
-        self.data.as_str()
-    }
-
-    pub fn to_ptrs(&self) -> (*const c_char, *const c_char) {
-        unsafe {
-            let mut begin = self.data.as_ptr();
-            let mut end = begin.add(self.data.len());
-            if let Some(range) = &self.range {
-                begin = begin.add(range.start);
-                end = begin.add(range.len());
-            }
-            (begin as *const c_char, end as *const c_char)
-        }
-    }
-
-    pub fn split_at(&mut self, index: usize) -> Option<Self> {
-        let offset = self.glyph_positions.get(index).map(|glyph| glyph.minx).unwrap_or(0.0);
-        let num = self.data.as_bytes().len() - index;
-        let mut new_glyphs = Vec::with_capacity(num);
-        for _ in 0..num {
-            let mut glyph = self.glyph_positions.pop()?;
-            glyph.x -= offset;
-            glyph.minx -= offset;
-            glyph.maxx -= offset;
-            self.glyph_positions.push(glyph);
-        }
-        new_glyphs.reverse();
-        let data = self.data.split_off(index);
-        Some(Self {
-            font: self.font.clone(),
-            font_size: self.font_size,
-            data,
-            glyph_positions: new_glyphs,
-            matrics: self.matrics,
-            dirty: true,
-            fit: false,
-            range: None,
-            x: self.x,
-            y: self.y,
-        })
-    }
-
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-    
 }
 
 #[derive(Debug, Clone)]
@@ -702,15 +520,6 @@ impl NvgInstance {
             let context = self.context;
             nvgFontFace(context, name.as_ptr());
             nvgFontSize(self.context, size);
-        }
-    }
-
-    pub fn draw_text_old(&mut self, text: &TextOld) {
-        unsafe {
-            let (ptr, end) = text.to_ptrs();
-            self.set_font(text.font.as_str(), text.font_size);
-            let mut metrics = self.text_metrics();
-            nvgText(self.context, text.x, self.invert_y(text.y + metrics.descender, 0.0), ptr, end);
         }
     }
 
@@ -773,101 +582,6 @@ impl NvgInstance {
         }
     }
     
-    pub fn update_text(&mut self, text: &mut TextOld) {
-        self.set_font(text.font.as_str(), text.font_size);
-        text.matrics = self.text_metrics();
-        if text.glyph_positions.len() == text.data.len() && !text.dirty {
-            return;
-        }
-        for _ in text.glyph_positions.len()..text.data.len() {
-            text.glyph_positions.push(
-                NVGglyphPosition {
-                    s: null(),
-                    x: 0.0,
-                    minx: 0.0,
-                    maxx: 0.0,
-                }
-            )
-        }
-        unsafe {
-            let glyph_positions = &mut text.glyph_positions;
-            let text = &text.data;
-            let ptr = text.as_ptr() as *const c_char;
-            let end = text.as_ptr().add(text.len()) as *const c_char;
-            nvgTextGlyphPositions(
-                self.context,
-                0.0,
-                0.0,
-                ptr,
-                end,
-                glyph_positions[..].as_mut_ptr(),
-                glyph_positions.len() as i32
-            );
-        }
-        text.dirty = false
-    }
-
-    pub fn fit_text(&mut self, text: &mut TextOld, pw: f32, ph: f32) {
-        if text.fit && !text.dirty {
-            return
-        }
-        let mut bigger = false;
-        loop {
-            text.dirty = true;
-            self.update_text(text);
-            let (x, y, w, h) = text.bounds();
-            if w > pw || h > ph {
-                bigger = true;
-                text.font_size -= 1.0;
-            } else if bigger {
-                break
-            } else {
-                bigger = false;
-                text.font_size += 1.0;
-            }
-        }
-        text.fit = true;
-        text.dirty = false;
-    }
-
-    pub fn text(&mut self, text: &str, font: &str, font_size: f32) -> TextOld {
-        self.set_font(font, font_size);
-        let mut matrics = self.text_metrics();
-        let mut glyph_positions = (0..text.len()).map(|_| {
-            NVGglyphPosition {
-                s: null(),
-                x: 0.0,
-                minx: 0.0,
-                maxx: 0.0,
-            }
-        }).collect::<Vec<NVGglyphPosition>>();
-        unsafe {
-            let ptr = text.as_ptr() as *const c_char;
-            let end = text.as_ptr().add(text.len()) as *const c_char;
-            nvgTextGlyphPositions(
-                self.context,
-                0.0,
-                0.0,
-                ptr,
-                end,
-                glyph_positions[..].as_mut_ptr(),
-                glyph_positions.len() as i32
-            );
-            TextOld {
-                font: font.to_string(),
-                font_size,
-                data: text.to_string(),
-                glyph_positions,
-                matrics,
-                dirty: true,
-                fit: false,
-                range: None,
-                x: 0.0,
-                y: 0.0
-            }
-        }
-    }
-
     pub fn create_texture_image(&mut self, texture: &Texture) -> Option<Image> {
         unsafe {
             let image = nvglCreateImageFromHandleGL3(

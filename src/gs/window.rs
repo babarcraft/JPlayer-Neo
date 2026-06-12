@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem::replace;
+use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 use glfw::{Action, Context, FlushedMessages, Glfw, GlfwReceiver, Key, MouseButton, PWindow, WindowEvent, WindowHint};
@@ -7,14 +9,14 @@ use crate::gs::gl::{check_errors, ErrorType};
 use crate::gs::shader::UniformValue;
 
 pub trait WindowHandler {
-    fn initialize(&mut self, window: &mut Window);
-    fn render(&mut self, dt: f32, window: &mut Window);
+    fn initialize(&mut self, window: &Window);
+    fn render(&mut self, dt: f32, window: &Window);
     fn handle_event(&mut self, event: WindowEvent, window: &Window);
 }
 
 pub struct Window {
     glfw: Glfw,
-    window: PWindow,
+    handle: Rc<RefCell<PWindow>>,
     events: GlfwReceiver<(f64, WindowEvent)>,
     pub mouse_position: (f32, f32),
 }
@@ -41,23 +43,23 @@ impl Window {
         
         let window = Window {
             glfw,
-            window,
+            handle: Rc::new(RefCell::new(window)),
             mouse_position: (0.0, 0.0),
             events,
         };
         Some(window)
     }
 
-    pub fn set_size(&mut self, width: u32, height: u32) {
-        self.window.set_size(width as i32, height as i32);
-    }
-    
     pub fn run(&mut self, handler: &mut dyn WindowHandler) {
         handler.initialize(self);
 
         let mut manual_change = false;
         let mut last = Some(Instant::now());
-        while !self.window.should_close() {
+        loop {
+            {
+                let mut handle = self.handle.borrow_mut();
+                if handle.should_close() { break; }
+            }
             self.glfw.poll_events();
 
             for (time, event) in glfw::flush_messages(&self.events) {
@@ -81,24 +83,18 @@ impl Window {
 
             check_errors("Render", true);
 
-            self.window.swap_buffers();
+            {
+                let mut handle = self.handle.borrow_mut();
+                handle.swap_buffers();
+            }
         }
     }
     
     pub fn events(&self) -> FlushedMessages<'_, (f64, WindowEvent)> {
         glfw::flush_messages(&self.events)
     }
-
-    pub fn get_clipboard(&self) -> Option<String> {
-        self.window.get_clipboard_string()
-    }
-
-    pub fn is_fullscreen(&self) -> bool {
-        todo!()
-    }
-
-    pub fn get_framebuffer_size(&self) -> (f32, f32) {
-        let (w, h) = self.window.get_framebuffer_size();
-        (w as f32, h as f32)
+    
+    pub fn handle(&self) -> Rc<RefCell<PWindow>> {
+        self.handle.clone()
     }
 }

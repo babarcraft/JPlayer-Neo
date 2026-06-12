@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 use mlua::{UserData, UserDataMethods};
@@ -215,7 +216,7 @@ impl VideoPlayer {
         } else {
             return None
         };
-        let video_playback = if let Some(video_stream) = &video_stream && let Some(video_surface) = video_surface {
+        let video_playback = if let Some((video_stream, video_surface)) = video_stream.as_ref().zip(video_surface) {
             let (queue, sender) = decode_worker.add_decode_job(video_stream, Some((44100, 1)), &handle);
             let (queue, view) = queue.unwrap_video();
             let playback = Rc::new(RefCell::new(VideoPlayback::new(queue, view, sender, playback_clock.unwrap())));
@@ -274,6 +275,19 @@ impl VideoPlayer {
             self.master_clock.pts_interpolated()
         } else {
             self.master_clock.pts()
+        }
+    }
+    
+    pub fn get_volume(&self) -> f32 {
+        self.audio_device.as_ref()
+            .map(|dev| dev.volume.load(Ordering::Relaxed))
+            .map(|vol| vol as f32 / 100.0)
+            .unwrap_or(100.0)
+    }
+    
+    pub fn set_volume(&mut self, volume: f32) {
+        if let Some(audio_device) = &mut self.audio_device {
+            audio_device.volume.store((volume * 100.0).round() as _, Ordering::Relaxed);
         }
     }
 

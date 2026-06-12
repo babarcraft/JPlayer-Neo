@@ -505,7 +505,6 @@ impl DecodeWorkerContext {
             if closed {
                 job.packet_queue.write().unwrap().close();
                 job.input_handle.notify_worker();
-                println!("Decoder closed!")
             }
             !closed
         });

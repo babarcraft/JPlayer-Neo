@@ -1,9 +1,9 @@
-use crate::gs::nvg::{Color, Image, NvgInstance, Shape, Text, TextFitType, TextOld};
+use crate::gs::nvg::{Color, Image, NvgInstance, Shape, Text, TextFitType};
 use crate::gs::window::Window;
 use crate::player::decoder::DecodeWorker;
 use crate::player::input::InputWorker;
 use crate::player::surface::VideoSurface;
-use glfw::{Action, Key, MouseButton, WindowEvent};
+use glfw::{Action, Key, MouseButton, PWindow, WindowEvent};
 use mlua::{AnyUserData, AsChunk, Function, IntoLua, IntoLuaMulti, LightUserData, Lua, MultiValue, Table, UserData, UserDataFields, UserDataMethods, Value};
 use std::cell::{Cell, RefCell, RefMut};
 use std::ops::Deref;
@@ -42,6 +42,13 @@ impl UserData for VideoPlayer {
         });
         fields.add_field_method_get("duration", |_, this| {
             Ok(this.estimated_duration)
+        });
+        fields.add_field_method_set("volume", |_, this, value: f32| {
+            this.set_volume(value);
+            Ok(())
+        });
+        fields.add_field_method_get("volume", |_, this| {
+            Ok(this.get_volume())
         });
     }
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
@@ -195,75 +202,23 @@ impl UserData for Text {
     }
 }
 
-impl UserData for TextOld {
-    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_set("x", |_, this, x: f32| {
-            this.x = x;
-            Ok(())
-        });
-        fields.add_field_method_set("y", |_, this, y: f32| {
-            this.y = y;
-            Ok(())
-        });
-        fields.add_field_method_get("len", |_, this| {
-            Ok(this.len())
-        });
-        fields.add_field_method_set("range", |lua, this, range: Value| {
-            this.range = if let Some(range) = range.as_table() {
-                let begin = range.get::<Value>(1)?.as_usize();
-                let end = range.get::<Value>(2)?.as_usize();
-                if begin.is_none() && end.is_none() {
-                    None
-                } else {
-                    let begin = begin.unwrap_or(0).max(0).min(this.len());
-                    let end = end.unwrap_or(this.len()).max(0).min(this.len());
-                    Some(begin.min(end)..end.max(begin))
-                }
-            } else {
-                None
-            };
-            Ok(())
-        });
-        fields.add_field_method_get("range", |lua, this| {
-            if let Some(range) = this.range.as_ref() {
-                let table = lua.create_table_from([
-                    (1, range.start),
-                    (2, range.end),
-                ])?;
-                return Ok(Value::Table(table));
-            }
-            Ok(Value::Nil)
-        })
-    }
-    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("bounds", |lua, this, (begin, end): (Option<usize>, Option<usize>)| {
-            let result: (f32, f32, f32, f32) = if begin.is_none() && end.is_none() {
-                this.bounds()
-            } else {
-                let begin = begin.unwrap_or(0);
-                let end = end.unwrap_or(this.len());
-                this.char_range_bounds(begin..end)
-            };
-
-            Ok(Value::Table(lua.create_table_from([
-                (1, result.0),
-                (2, result.1),
-                (3, result.2),
-                (4, result.3),
-            ])?))
-        });
-    }
-}
-
 struct Task {
     last: Option<Instant>,
-    canceled: Rc<RefCell<bool>>,
+    handle: TaskHandle,
     predicate: Function,
     function: Function,
 }
 
+#[derive(Clone)]
 struct TaskHandle {
     canceled: Rc<RefCell<bool>>,
+}
+
+impl Drop for TaskHandle {
+    fn drop(&mut self) {
+        *self.canceled.borrow_mut() = false;
+        println!("Canceled task");
+    }
 }
 
 impl UserData for TaskHandle {
@@ -278,17 +233,16 @@ impl UserData for TaskHandle {
 
 impl Task {
     fn new(predicate: Function, function: Function) -> Self {
-        let last = Instant::now();
         Self {
             last: None,
-            canceled: Rc::new(RefCell::new(false)),
+            handle: TaskHandle { canceled: Rc::new(RefCell::new(false)), },
             predicate,
             function,
         }
     }
     
     fn is_canceled(&self) -> bool {
-        *self.canceled.borrow()
+        *self.handle.canceled.borrow()
     }
     
     fn check(&self) -> Result<bool, mlua::Error> {
@@ -305,9 +259,7 @@ impl Task {
     }
     
     fn handle(&self) -> TaskHandle {
-        TaskHandle {
-            canceled: self.canceled.clone(),
-        }
+        self.handle.clone()
     }
 }
 
@@ -317,7 +269,7 @@ struct UIRenderContext {
     frame_buffer_size: (f32, f32),
     
     tasks: Vec<Task>,
-
+    window_handle: Rc<RefCell<PWindow>>,
     render_handle: Option<Function>,
     event_handle: Option<Function>,
     update_handle: Option<Function>,
@@ -325,7 +277,7 @@ struct UIRenderContext {
 }
 
 impl UIRenderContext {
-    fn new(nvg: &NvgInstance) -> Self {
+    fn new(nvg: &NvgInstance, window_handle: Rc<RefCell<PWindow>>) -> Self {
         let nvg = nvg.clone();
         let size = nvg.relative(1.0, 1.0);
         Self {
@@ -336,6 +288,7 @@ impl UIRenderContext {
             render_handle: None,
             event_handle: None,
             update_handle: None,
+            window_handle,
             dirty: true
         }
     }
@@ -532,8 +485,8 @@ impl UserData for IndirectCommandHandle {
 struct UIRenderContextRef(*mut UIRenderContext);
 
 impl UIRenderContextRef {
-    fn new(nvg: &NvgInstance) -> Self {
-        let rc = Box::new(UIRenderContext::new(nvg));
+    fn new(nvg: &NvgInstance, window_handle: Rc<RefCell<PWindow>>) -> Self {
+        let rc = Box::new(UIRenderContext::new(nvg, window_handle));
         UIRenderContextRef(Box::into_raw(rc))
     }
 
@@ -593,6 +546,9 @@ impl UserData for UIRenderContextRef {
             table.set("h", h)?;
             Ok(table)
         });
+        methods.add_method("getClipboard", |lua, this, ()| {
+            Ok(this.get().window_handle.borrow().get_clipboard_string().unwrap_or(String::new()))
+        });
         methods.add_method_mut("newText", |_, this, (init_text, font, size): (mlua::String, mlua::String, f32)| {
             let mut text = Text::new(&this.get().nvg, (font.to_str()?.as_ref(), size));
             text.set_text(init_text.to_str()?.as_ref());
@@ -601,17 +557,19 @@ impl UserData for UIRenderContextRef {
         methods.add_method_mut("newVideoSurface", |_, this, (): ()| {
             Ok(VideoSurface::new())
         });
-        methods.add_method("newVideoPlayer", |lua, this, (path, surface): (String, AnyUserData)| {
+        methods.add_method("newVideoPlayer", |lua, this, (path, surface, input_worker, decode_worker): (String, AnyUserData, AnyUserData, AnyUserData)| {
             let mut surface = surface.borrow_mut::<VideoSurface>()?;
-            let table = lua.create_table()?;
-            let mut input_worker = InputWorker::new();
-            let mut decode_worker = DecodeWorker::new();
+            let mut input_worker = input_worker.borrow_mut::<InputWorker>()?;
+            let mut decode_worker = decode_worker.borrow_mut::<DecodeWorker>()?;
             let input = Input::open(&path, &[]).unwrap();
             let player = VideoPlayer::new(input, Some(&mut *surface), &mut decode_worker, &mut input_worker).unwrap();
-            table.set("input", input_worker)?;
-            table.set("decode", decode_worker)?;
-            table.set("player", player)?;
-            return Ok(table);
+            return Ok(player);
+        });
+        methods.add_method("newInputWorker", |lua, this, (): ()| {
+            Ok(InputWorker::new())
+        });
+        methods.add_method("newDecodeWorker", |lua, this, (): ()| {
+            Ok(DecodeWorker::new())
         });
         methods.add_method_mut("addTask", |_, this, (predicate, function): (Function, Function)| {
             let task = Task::new(predicate, function);
@@ -671,10 +629,13 @@ impl UIManager {
     pub fn new(nvg: &NvgInstance, window: &Window) -> Self {
         let lua = Lua::new();
         let globals = lua.globals();
-        let context = UIRenderContextRef::new(nvg);
+        let handle = window.handle();
+        let (w, h) = {
+            let handle = handle.borrow();
+            handle.get_framebuffer_size()
+        };
+        let context = UIRenderContextRef::new(nvg, handle);
         globals.set("ui", context.clone()).unwrap();
-        globals.set("dirty", true).unwrap();
-        let (w, h) = window.get_framebuffer_size();
         Self {
             lua,
             context,
@@ -693,7 +654,6 @@ impl UIManager {
     }
 
     pub fn render(&self, width: f32, height: f32) -> Result<(), mlua::Error> {
-        let globals = self.lua.globals();
         let ui = self.context.get();
         ui.frame_buffer_size = (width, height);
         ui.render()?;
