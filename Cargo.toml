@@ -17,8 +17,8 @@ nanovg-sys = {
 cpal = "0.17.3"
 reqwest = { version = "0.11", features = ["blocking"] }
 base64 = "0.22.1"
-regex = "1.12.3"
 json = "0.12.4"
 libwebp = { version = "0.1.2", features = ["0_6"] }
 libc = "0.2.186"
 mlua = { version = "0.11.6", features = ["lua55"] }
+crc32fast = "1.5.0"

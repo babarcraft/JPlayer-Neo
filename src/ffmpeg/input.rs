@@ -20,7 +20,7 @@ use crate::player::clock::{AtomicF64, AtomicInstant};
 
 static INPUT_ID: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum StreamType {
     Video, Audio, Data, Other
 }
@@ -43,7 +43,17 @@ pub struct Stream {
     pub start_time: f64,
     pub index: i32,
     pub stream_type: StreamType,
+    pub duration: f64,
     pub parameters: *mut AVCodecParameters
+}
+
+#[derive(Copy, Clone)]
+pub struct StreamMetaData {
+    pub timebase: f64,
+    pub start_time: f64,
+    pub index: i32,
+    pub stream_type: StreamType,
+    pub duration: f64,
 }
 
 unsafe impl Send for Stream {}
@@ -51,6 +61,7 @@ unsafe impl Send for Stream {}
 impl Stream {
     fn from_stream(other: *const AVStream) -> Self {
         unsafe {
+            let stream = &*other;
             let parameters = avcodec_parameters_alloc();
             if parameters.is_null() {
                 panic!("avcodec_parameters_alloc failed.");
@@ -59,11 +70,22 @@ impl Stream {
             let timebase = av_q2d((*other).time_base);
             Self {
                 timebase,
-                start_time: (*other).start_time as f64 * timebase,
-                index: (*other).index,
+                start_time: stream.start_time as f64 * timebase,
+                index: stream.index,
+                duration: stream.duration as f64 * timebase,
                 stream_type: StreamType::try_from((*((*other).codecpar)).codec_type).unwrap(),
                 parameters
             }
+        }
+    }
+
+    pub fn metadata(&self) -> StreamMetaData {
+        StreamMetaData {
+            timebase: self.timebase,
+            start_time: self.start_time,
+            index: self.index,
+            stream_type: self.stream_type,
+            duration: self.duration,
         }
     }
 }
@@ -89,6 +111,7 @@ impl Clone for Stream {
                 start_time: self.start_time,
                 index: self.index,
                 stream_type: self.stream_type.clone(),
+                duration: self.duration,
                 parameters
             }
         }

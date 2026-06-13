@@ -1,6 +1,14 @@
-use ffmpeg_sys_next::{av_grow_packet, av_malloc, av_new_packet, av_packet_alloc, av_packet_clone, av_packet_from_data, av_packet_new_side_data, av_packet_side_data_new, av_read_frame, AVFormatContext, AVPacket, AVPacketSideData, AVPacketSideDataType};
 use crate::ffmpeg::error::Error;
+use ffmpeg_sys_next::{av_new_packet, AV_PKT_FLAG_KEY};
+use ffmpeg_sys_next::av_packet_alloc;
+use ffmpeg_sys_next::av_packet_clone;
+use ffmpeg_sys_next::av_packet_new_side_data;
+use ffmpeg_sys_next::av_read_frame;
+use ffmpeg_sys_next::AVFormatContext;
+use ffmpeg_sys_next::AVPacket;
+use ffmpeg_sys_next::AVPacketSideDataType;
 
+#[derive(Clone)]
 pub struct ByteBuffer {
     buffer: Vec<u8>,
     read_index: usize,
@@ -43,6 +51,16 @@ impl ByteBuffer {
     pub fn write_ser<T: Serializable>(&mut self, obj: &T) {
         obj.serialize(self);
     }
+
+    pub fn write_zero<T: Sized>(&mut self) {
+        for _ in 0..size_of::<T>() {
+            self.buffer.push(0);
+        }
+    }
+
+    pub fn read_zero<T: Sized>(&mut self) {
+        self.read_index += size_of::<T>();
+    }
     
     pub fn len(&self) -> usize {
         self.buffer.len()
@@ -59,7 +77,26 @@ impl ByteBuffer {
     pub fn remaining(&self) -> usize {
         self.buffer.len() - self.read_index
     }
-    
+
+    pub fn internal(&self) -> &[u8] {
+        &self.buffer[..]
+    }
+
+    pub fn internal_mut(&mut self, size: usize) -> &mut [u8] {
+        if self.remaining() < size {
+            for _ in self.read_index..self.read_index + size {
+                self.buffer.push(0);
+            }
+        }
+        &mut self.buffer[self.read_index..size]
+    }
+
+    pub fn crc_32(&self) -> u32 {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(self.internal());
+        hasher.finalize()
+    }
+
     pub fn clear(&mut self) {
         self.buffer.clear();
         self.read_index = 0;
@@ -91,6 +128,26 @@ macro_rules! impl_byte_serializable {
 }
 
 impl_byte_serializable!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64);
+
+impl Serializable for bool {
+    fn serialize(&self, buffer: &mut ByteBuffer) {
+        let val = if *self { 1u8 } else { 0u8 };
+        buffer.write_ser(&val);
+    }
+    fn deserialize(buffer: &mut ByteBuffer) -> Option<Self> {
+        buffer.read_ser::<u8>().map(|v| v == 1)
+    }
+}
+
+impl Serializable for usize {
+    fn serialize(&self, buffer: &mut ByteBuffer) {
+        buffer.write_ser(&(*self as u64));
+    }
+    fn deserialize(buffer: &mut ByteBuffer) -> Option<Self> {
+        let num = buffer.read_ser::<u64>()? as usize;
+        Some(num)
+    }
+}
 
 pub struct Packet {
     pub(super) pointer: *mut AVPacket,
@@ -159,6 +216,16 @@ impl Packet {
         unsafe {
             (*self.pointer).flags
         }
+    }
+
+    pub fn is_key(&self) -> bool {
+        self.flags() & AV_PKT_FLAG_KEY > 0
+    }
+}
+
+impl PartialEq for Packet {
+    fn eq(&self, other: &Self) -> bool {
+        self.pts() == other.pts() && self.flags() == other.flags() && self.stream_index() == other.stream_index()
     }
 }
 

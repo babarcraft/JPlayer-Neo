@@ -19,6 +19,7 @@ use crate::ffmpeg::error::Error;
 use crate::ffmpeg::input::{Input, Stream};
 use crate::ffmpeg::packet::{ByteBuffer, Packet};
 use crate::gs::texture::Texture;
+use crate::player::cache::{Cache, CacheError};
 use crate::player::decoder::DecodeWorkerMessage;
 
 /// Serves as a normal queue, with the only difference being that it counts the duration of packets from the lowest to the highest instead of just a number.
@@ -180,8 +181,51 @@ struct InputStreamEntry {
     consumer_notifier: Sender<DecodeWorkerMessage>,
 }
 
+enum JobInput {
+    Input(Input),
+    Cache(Cache)
+}
+
+impl JobInput {
+
+    fn serial(&self) -> u32 {
+        match self {
+            JobInput::Input(input) => input.serial,
+            JobInput::Cache(cache) => cache.serial
+        }
+    }
+
+    fn input(&self) -> &Input {
+        match self {
+            JobInput::Input(input) => input,
+            JobInput::Cache(cache) => &cache.input
+        }
+    }
+
+    fn has_error(&self) -> bool {
+        match self {
+            JobInput::Input(input) => input.read_error,
+            JobInput::Cache(cache) => cache.has_error()
+        }
+    }
+
+    fn seek(&mut self, min: f64, time: f64, stream: Option<i32>) -> Result<(), Error> {
+        match self {
+            JobInput::Input(input) => input.seek(min, time, stream),
+            JobInput::Cache(cache) => match cache.seek(time) {
+                Ok(()) => Ok(()),
+                Err(error) => match error {
+                    CacheError::SourceReadError(error) => Err(error),
+                    _ => panic!("Cache seek error {:?}", error)
+                }
+            }
+        }
+    }
+
+}
+
 struct InputReadJob {
-    input: Input,
+    input: JobInput,
     entries: Vec<Option<InputStreamEntry>>,
     receiver: Receiver<InputCommand>,
     begin: bool,
@@ -204,6 +248,44 @@ impl InputReadJob {
             return false
         }
         true
+    }
+
+    pub fn can_cache(&self) -> bool {
+        if let JobInput::Cache(cache) = &self.input {
+            !cache.input.read_error
+        } else {
+            false
+        }
+    }
+
+    fn run_cache(&mut self) -> Result<(), CacheError> {
+        match &mut self.input {
+            JobInput::Input(_) => Ok(()),
+            JobInput::Cache(cache) => {
+                cache.write_next()
+            }
+        }
+    }
+
+    fn read_packet(&mut self) -> Result<Packet, Error> {
+        match &mut self.input {
+            JobInput::Input(input) => {
+                input.read_packet()
+            }
+            JobInput::Cache(cache) => {
+                let packet = cache.read_packet();
+                match packet {
+                    Ok(packet) => Ok(packet),
+                    Err(error) => {
+                        match error {
+                            CacheError::SourceReadError(error) => Err(error),
+                            CacheError::Eof => Err(Error::from_code(AVERROR_EOF)),
+                            _ => panic!("Cache error: {:?}", error)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn min_queued(&self) -> Option<f64> {
@@ -386,17 +468,35 @@ impl InputWorkerContext {
     fn do_pass(&mut self) -> bool {
         let mut available = self.inputs.iter_mut()
             .filter(|pair| pair.begin)
-            .filter(|pair| !pair.input.read_error)
-            .filter(|pair|
-                pair.min_queued()
-                    .and_then(|q| Some(q < 5.0))
-                    .unwrap_or(true) ||
-                !pair.serial_matches(pair.input.serial)
-            ).peekable();
+            .filter(|pair| {
+                let has_error = pair.input.has_error();
+                if has_error {
+                    println!("Has Error")
+                }
+                !has_error
+            })
+            .filter(|pair| {
+                    let queue_has_space = pair.min_queued()
+                        .and_then(|q| Some(q < 5.0))
+                        .unwrap_or(true);
+                    let serial_changed = !pair.serial_matches(pair.input.serial());
+                    let can_cache = pair.can_cache();
+                    queue_has_space || serial_changed || can_cache
+                }).peekable();
         let empty = available.peek().is_none();
-        let mut buffer = &mut self.buffer;
         for pair in available {
-            match pair.input.read_packet() {
+            if let Some(err) = pair.run_cache().err() {
+                match err {
+                    CacheError::SourceReadError(err) => println!("Source read error {:?}", err),
+                    _ => println!("Error while reading {:?}", err)
+                }
+            }
+            if !pair.min_queued()
+                .and_then(|q| Some(q < 5.0))
+                .unwrap_or(true) {
+                continue;
+            }
+            match pair.read_packet() {
                 Ok(packet) => {
                     if let Some(entry) = &pair.entries[packet.stream_index() as usize] {
                         let mut queue = entry.queue.write().unwrap();
@@ -524,7 +624,7 @@ impl InputWorker {
 
         let queue = (0..input.streams.len()).map(|_| None).collect();
         let job = InputReadJob {
-            input,
+            input: JobInput::Cache(Cache::new("test.bin", input)),
             entries: queue,
             receiver,
             begin: false
