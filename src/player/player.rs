@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::time::Instant;
@@ -8,6 +8,7 @@ use mlua::{UserData, UserDataMethods};
 use crate::ffmpeg::input::{Input, InterruptContext, Stream, StreamType};
 use crate::gs::texture::InternalFormat;
 use crate::player::audio::AudioDevice;
+use crate::player::cache::{CacheReader, SegmentView};
 use crate::player::clock::Clock;
 use crate::player::decoder::{DecodeWorker, DecodeWorkerMessage};
 use crate::player::input::{InputCommand, InputJobHandle, InputWorker, InputWorkerMessage};
@@ -170,37 +171,73 @@ impl Drop for VideoPlayback {
 pub struct VideoPlayer {
     pub video_playback: Option<Rc<RefCell<VideoPlayback>>>,
     pub audio_device: Option<AudioDevice>,
-    pub video_stream: Option<Stream>,
-    pub audio_stream: Option<Stream>,
     pub master_clock: Box<dyn Clock>,
     pub estimated_duration: f64,
-
-    input_interrupt: InterruptContext,
+    pub start_time: f64,
 
     input_job_handle: InputJobHandle,
-    input_worker_sender: Sender<InputWorkerMessage>,
     decode_worker_sender: Sender<DecodeWorkerMessage>,
 }
 
+pub enum InputSource {
+    Input(Input),
+    CachedInput(Input, String),
+    PreCachedInput(CacheReader, Vec<Stream>),
+}
+
+impl InputSource {
+    
+    fn stream(&self, type_: StreamType) -> Option<&Stream> {
+        match self {
+            InputSource::Input(input) | InputSource::CachedInput(input, ..) => {
+                input.streams.iter().find(|s| s.stream_type == type_)
+            }
+            InputSource::PreCachedInput(_, streams) => 
+                streams.iter().find(|s| s.stream_type == type_),
+        }
+    }
+    
+    fn duration(&self) -> f64 {
+        match self {
+            InputSource::Input(input) | InputSource::CachedInput(input, ..) => input.duration(),
+            InputSource::PreCachedInput(cache, _) => cache.duration(),
+        }
+    }
+    
+    fn start_time(&self) -> f64 {
+        match self {
+            InputSource::Input(input) | InputSource::CachedInput(input, ..) => input.start_time(),
+            InputSource::PreCachedInput(cache, _) => cache.start_time(),
+        }
+    }
+    
+    fn add_to_worker(self, worker: &mut InputWorker) -> InputJobHandle {
+        match self {
+            InputSource::Input(input) => {
+                worker.add_input::<String>(input, None)
+            }
+            InputSource::CachedInput(input, path) => {
+                worker.add_input(input, Some(path))
+            }
+            InputSource::PreCachedInput(cache, streams) => {
+                worker.add_pre_cached(cache)
+            }
+        }
+    }
+    
+}
+
 impl VideoPlayer {
-    pub fn new(input: Input, video_surface: Option<&mut VideoSurface>, decode_worker: &mut DecodeWorker, input_worker: &mut InputWorker) -> Option<VideoPlayer> {
-        let audio_stream = input
-            .streams
-            .iter()
-            .find(|stream| stream.stream_type == StreamType::Audio)
-            .cloned();
-        let video_stream = input
-            .streams
-            .iter()
-            .find(|stream| stream.stream_type == StreamType::Video)
-            .cloned();
+    pub fn new(source: InputSource, video_surface: Option<&mut VideoSurface>, decode_worker: &mut DecodeWorker, input_worker: &mut InputWorker) -> Option<VideoPlayer> {
+        let audio_stream = source.stream(StreamType::Audio).cloned();
+        let video_stream = source.stream(StreamType::Video).cloned();
         let mut playback_clock: Option<Box<dyn Clock>> = None;
         let mut master_clock: Option<Box<dyn Clock>> = None;
 
-        let estimated_duration = input.duration();
+        let start_time = source.start_time();
+        let estimated_duration = source.duration();
 
-        let input_interrupt = input.interrupt_context.as_ref().clone();
-        let handle = input_worker.add_input(input);
+        let handle = source.add_to_worker(input_worker);
 
         let audio_device = if let Some(audio_stream) = &audio_stream {
             Some({
@@ -229,15 +266,16 @@ impl VideoPlayer {
         Some(VideoPlayer {
             video_playback,
             audio_device,
-            video_stream,
-            audio_stream,
-            input_interrupt,
             master_clock: master_clock.unwrap(),
             input_job_handle: handle,
-            input_worker_sender: input_worker.get_sender(),
             decode_worker_sender: decode_worker.get_sender(),
             estimated_duration,
+            start_time
         })
+    }
+
+    pub fn cache_segments(&'_ self) -> Option<RwLockReadGuard<'_, Vec<SegmentView>>> {
+        self.input_job_handle.cache_segments()
     }
 
     pub fn play(&mut self) {
@@ -258,24 +296,21 @@ impl VideoPlayer {
         }
     }
 
-    pub fn seek(&mut self, target: f64) {
-        self.input_job_handle.seek(0.0, target, None);
+    pub fn seek(&mut self, mut target: f64) {
+        target += self.start_time;
+        self.input_job_handle.seek(self.start_time, target, None);
         self.master_clock.set_seek_flag(target);
         if let Some(playback) = &mut self.video_playback {
             let playback = playback.borrow_mut();
             playback.frame_queue_view.set_seek(target);
         }
-        self.input_interrupt.interrupt();
+        // self.input_interrupt.interrupt();
         self.decode_worker_sender.send(DecodeWorkerMessage::Wakeup).unwrap();
-        self.input_worker_sender.send(InputWorkerMessage::Update).unwrap();
+        self.input_job_handle.notify_worker();
     }
 
     pub fn current_pts(&self) -> f64 {
-        if self.is_playing() {
-            self.master_clock.pts_interpolated()
-        } else {
-            self.master_clock.pts()
-        }
+        self.master_clock.pts() - self.start_time
     }
     
     pub fn get_volume(&self) -> f32 {

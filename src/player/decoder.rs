@@ -68,13 +68,14 @@ impl AudioRingView {
 
     pub fn check_seek_and_clear(&self, frame: &Frame) -> bool {
         let seek = self.seek.load(Ordering::SeqCst);
-        if seek <= 0f64 {
+        let avoid_serial = self.seek_avoid_serial.load(Ordering::SeqCst);
+        let avoid = Some(avoid_serial) == frame.serial;
+        if seek <= 0f64 && !avoid {
             return false;
         }
-        let avoid = self.seek_avoid_serial.load(Ordering::SeqCst);
-        if Some(avoid) == frame.serial {
-            true
-        } else if seek > frame.pts.unwrap_or(0.0) + frame.duration.unwrap_or(0.0) {
+        let pts = frame.pts.unwrap_or(0.0);
+        let duration = frame.duration.unwrap_or(0.0);
+        if seek > pts + duration || avoid {
             true
         } else {
             self.seek.store(-1.0, Ordering::SeqCst);
@@ -163,7 +164,6 @@ impl AudioRingBuffer {
         let seek: f64 = self.seek.load(Ordering::SeqCst);
         if seek >= 0.0 {
             if pts < seek && pts + time < seek || self.seek_avoid_serial.load(Ordering::SeqCst) == current_serial {
-                self.pts.store(pts + time, Ordering::SeqCst);
                 self.clear();
                 self.skips += 1;
                 return to_copy;

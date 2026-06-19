@@ -44,14 +44,14 @@ unsafe extern "C" fn get_format_callback(context: *mut AVCodecContext, format: *
 
 fn get_hardware_pix_format(codec: *const AVCodec) -> Option<(AVHWDeviceType, AVPixelFormat)> {
     unsafe {
-        let mut i = 0;
+        let i = 0;
         loop {
             let config = avcodec_get_hw_config(codec, i);
             if config.is_null() {
                 return None;
             }
-            return Some(((*config).device_type, (*config).pix_fmt));
-            i = i + 1;
+            let config = & *config;
+            return Some((config.device_type, config.pix_fmt));
         }
     }
 }
@@ -59,8 +59,9 @@ fn get_hardware_pix_format(codec: *const AVCodec) -> Option<(AVHWDeviceType, AVP
 impl Decoder {
     pub fn new(stream: &Stream, options: &[(&str, &str)]) -> Result<Decoder, Error> {
         unsafe {
-            let parameters = stream.parameters;
-            let codec = avcodec_find_decoder((*parameters).codec_id);
+            let parameters = &stream.parameters;
+            let inner = parameters.inner_mut();
+            let codec = avcodec_find_decoder(inner.codec_id);
             if codec.is_null() {
                 return Err(Error::from_code(AVERROR_DECODER_NOT_FOUND))
             }
@@ -68,8 +69,9 @@ impl Decoder {
             if context.is_null() {
                 return Err(Error::from_code(AVERROR_UNKNOWN))
             }
+            let context = &mut *context;
 
-            let result = avcodec_parameters_to_context(context, parameters);
+            let result = avcodec_parameters_to_context(context, inner);
             if result < 0 {
                 return Err(Error::from_code(result))
             }
@@ -84,9 +86,9 @@ impl Decoder {
                     println!("Failed to create hardware device context! ({:?})", Error::from_code(result));
                 } else {
                     *preferred_pix_format = pixel_format;
-                    (*context).get_format = Some(get_format_callback);
-                    (*context).hw_device_ctx = device_context;
-                    (*context).opaque = preferred_pix_format.as_mut() as *mut _ as *mut c_void;
+                    context.get_format = Some(get_format_callback);
+                    context.hw_device_ctx = device_context;
+                    context.opaque = preferred_pix_format.as_mut() as *mut _ as *mut c_void;
                     is_hardware = true;
                 }
             }

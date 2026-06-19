@@ -89,10 +89,17 @@ declare interface VideoSurfaceHandle {}
 declare interface InputWorker {}
 declare interface DecodeWorker {}
 
+type CacheSegment = {
+    start: number,
+    end: number,
+    size: number
+};
+
 declare interface VideoPlayerHandle {
     play(): void;
     seek(time: number): void;
 
+    cacheSegments: [CacheSegment]
     duration: number;
     pts: number;
     volume: number;
@@ -163,6 +170,7 @@ declare interface UI {
 
     newVideoPlayer(
         path: string,
+        type: "input" | "cached" | "precached",
         surface: VideoSurfaceHandle,
         inputWorker: InputWorker,
         decodeWorker: DecodeWorker

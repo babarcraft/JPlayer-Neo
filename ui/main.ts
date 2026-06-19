@@ -1,10 +1,78 @@
 import {ComponentBase, focused, Group, Label, Root, setRoot, Slider, TextInput, VideoSurface} from "./components";
 
+class PlayerTime extends Slider {
+
+    player?: VideoPlayerHandle
+    private _cacheSegments: CacheSegment[] = []
+    private draws: IndirectCommandHandle[] = []
+    private segmColor: Color
+
+    constructor(backgroundColor: Color, foregroundColor: Color) {
+        super("horizontal", backgroundColor, foregroundColor);
+
+        let [r, g, b, a] = foregroundColor
+        this.segmColor = [1 - r, 1 - g, 1 - b, 1]
+    }
+
+    render() {
+        super.render();
+
+        if(!this.player) return;
+
+        let duration = this.player.duration;
+        let [x, y, w, h] = this.bounds();
+        let sh = 3
+        y = y + (h - sh) / 2
+        let i = 1
+        for(let seg of this._cacheSegments) {
+            let sx = x + (seg.start / duration) * w;
+            let sw = ((seg.end - seg.start) / duration) * w
+            let [r, g, b, a] = this.segmColor
+            this.draws[i] = ui.pushIndirect({
+                type: "shapeFillColor",
+                color: this.segmColor,
+                shape: ["rect", sx, y, sw, sh]
+            })
+            i++
+        }
+    }
+
+    set cacheSegments(segments: CacheSegment[]) {
+        this._cacheSegments = segments;
+        if(segments.length != this.draws.length) {
+            ui.setDirty();
+            return
+        }
+
+        if(!this.player) return;
+        let duration = this.player.duration;
+        let [x, y, w, h] = this.bounds();
+        let sh = 5
+        y = (h - sh) / 2
+        this.draws = []
+        let i = 1;
+        for(let seg of this._cacheSegments) {
+            let sx = x + (seg.start / duration) * w;
+            let sw = ((seg.end - seg.start) / duration) * w
+            let cmd = this.draws[i++]
+            if(!cmd) {
+                ui.setDirty();
+                return
+            }
+            if(cmd.command.type == "shapeFillColor") {
+                cmd.command.shape = ["rect", sx, y, sw, sh]
+            }
+            cmd.update()
+        }
+    }
+
+}
+
 class PlayerControls extends Root {
 
     player: VideoPlayerHandle | null = null
     backgroundColor: Color = [0.2, 0.2, 0.2, 0.5]
-    timelineSlider: Slider;
+    timelineSlider: PlayerTime;
     volumeSlider: Slider;
     passedTime: Label;
     remTime: Label;
@@ -16,7 +84,7 @@ class PlayerControls extends Root {
     input: TextInput
 
     constructor() {
-        let timelineSlider = new Slider("horizontal", [0.5, 0.5, 0.5, 0.2], [1, 1, 1, 1]);
+        let timelineSlider = new PlayerTime([0.5, 0.5, 0.5, 0.2], [1, 1, 1, 1]);
         let volumeSlider = new Slider("horizontal", [0.5, 0.5, 0.5, 0.2], [1, 1, 1, 1]);
         let passedTime = new Label([1, 1, 1, 1]);
         let remTime = new Label([1, 1, 1, 1]);
@@ -69,6 +137,8 @@ class PlayerControls extends Root {
                 let pts = this.player.pts;
                 let duration = this.player.duration;
                 timelineSlider.progress = pts / duration
+                timelineSlider.player = this.player;
+                timelineSlider.cacheSegments = this.player.cacheSegments
             }
         })
         timelineSlider.onNewTarget = progress => {
@@ -159,7 +229,8 @@ class PlayerScene extends Root {
         this.surface = surface;
         this.controls = controls
         controls.input.onEnterPressed = () => {
-            this.player = ui.newVideoPlayer(controls.input.text.text, surface.surface, inputWorker, decodeWorker)
+            this.player = ui.newVideoPlayer(controls.input.text.text, "input", surface.surface, inputWorker, decodeWorker)
+            this.player.volume = 0.0;
             this.player.play();
             controls.player = this.player
             controls.input.text.text = ""

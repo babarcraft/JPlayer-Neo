@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use ffmpeg_sys_next::MQ_PRIO_MAX;
 use mlua::prelude::LuaValue;
 use crate::ffmpeg::input::Input;
-use crate::player::player::VideoPlayer;
+use crate::player::cache::CacheReader;
+use crate::player::player::{InputSource, VideoPlayer};
 
 pub enum InputEvent {
     MouseMoved((f32, f32), (f32, f32)),
@@ -35,6 +36,7 @@ impl UserData for RenderCommand {}
 impl UserData for VideoSurface {}
 impl UserData for InputWorker {}
 impl UserData for DecodeWorker {}
+
 impl UserData for VideoPlayer {
     fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("pts", |_, this| {
@@ -49,6 +51,25 @@ impl UserData for VideoPlayer {
         });
         fields.add_field_method_get("volume", |_, this| {
             Ok(this.get_volume())
+        });
+        fields.add_field_method_get("cacheSegments", |lua, this| {
+            let segments = this.cache_segments();
+            let table = if let Some(segments) = segments {
+                let table = lua.create_table_with_capacity(segments.len(), segments.len())?;
+                for segment in segments.iter() {
+                    let range = segment.range();
+                    let size = segment.size();
+                    table.push(lua.create_table_from([
+                        ("start", Value::Number(range.start)),
+                        ("end", Value::Number(range.end)),
+                        ("size", Value::Number((size / 1024) as f64)),
+                    ])?)?;
+                }
+                table
+            } else {
+                lua.create_table()?
+            };
+            Ok(table)
         });
     }
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
@@ -557,11 +578,27 @@ impl UserData for UIRenderContextRef {
         methods.add_method_mut("newVideoSurface", |_, this, (): ()| {
             Ok(VideoSurface::new())
         });
-        methods.add_method("newVideoPlayer", |lua, this, (path, surface, input_worker, decode_worker): (String, AnyUserData, AnyUserData, AnyUserData)| {
+        methods.add_method("newVideoPlayer", |lua, this, (path, typ, surface, input_worker, decode_worker): (mlua::String, mlua::String, AnyUserData, AnyUserData, AnyUserData)| {
             let mut surface = surface.borrow_mut::<VideoSurface>()?;
             let mut input_worker = input_worker.borrow_mut::<InputWorker>()?;
             let mut decode_worker = decode_worker.borrow_mut::<DecodeWorker>()?;
-            let input = Input::open(&path, &[]).unwrap();
+            let path = path.to_str()?;
+            let typ = typ.to_str()?;
+            let input = match typ.as_ref() {
+                "cached" => {
+                    let input = Input::open(&path, &[]).unwrap();
+                    Some(InputSource::CachedInput(input, "test.bin".to_string()))
+                }
+                "input" => {
+                    let input = Input::open(&path, &[]).unwrap();
+                    Some(InputSource::Input(input))
+                }
+                "precached" => {
+                    let (cache, streams) = CacheReader::load(path.as_ref()).unwrap();
+                    Some(InputSource::PreCachedInput(cache, streams))
+                }
+                _ => None
+            }.unwrap();
             let player = VideoPlayer::new(input, Some(&mut *surface), &mut decode_worker, &mut input_worker).unwrap();
             return Ok(player);
         });

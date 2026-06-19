@@ -372,11 +372,16 @@ impl VideoSurface {
 
     pub fn upload(&mut self, frame: &Frame, plane_formats: &[InternalFormat], chroma: Option<usize>) {
         if !self.can_upload() {
+            println!("Dropped frame boy!");
             return;
         }
 
         {
             let slot = &mut self.upload_slots[self.write_index as usize];
+            if !slot.fence.check_done(None) {
+                println!("Dropped frame boy!");
+                return;
+            }
             slot.upload(frame, plane_formats, chroma);
         }
 

@@ -369,6 +369,7 @@ export class Slider extends ComponentBase {
     private indirect: IndirectCommandHandle | null = null
     backgroundColor: Color
     foregroundColor: Color
+    private drag: boolean = false
     private readonly ws: [boolean, boolean]
 
     constructor(direction: Direction, backgroundColor: Color, foregroundColor: Color) {
@@ -415,10 +416,12 @@ export class Slider extends ComponentBase {
         let [x, y, w, h] = this.bounds();
         switch(event.type) {
             case "mouseButton":
-                if(this.onNewTarget && event.action == InputAction.Press) {
-                    this.onNewTarget((event.pos.x - x) / w)
-                }
+                this.drag = event.action == InputAction.Press || event.action == InputAction.Repeat
                 break
+            case "mouseMoved":
+                if(this.onNewTarget && this.drag) {
+                    this.onNewTarget((event.to.x - x) / w)
+                }
         }
         return null;
     }

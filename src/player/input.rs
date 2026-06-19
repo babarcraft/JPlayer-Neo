@@ -1,28 +1,18 @@
-use std::cell::Cell;
-use std::collections::VecDeque;
-use std::fs::File;
-use std::{fs, io};
-use std::io::BufWriter;
-use std::mem::transmute;
-use std::ops::Deref;
-use std::path::Path;
-use std::rc::Rc;
-use std::sync::{mpsc, Arc, Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
-use std::thread::JoinHandle;
-use ffmpeg_sys_next::{register_t, AVERROR_EOF, AV_NOPTS_VALUE};
-use glfw::GamepadButton::ButtonB;
-use reqwest::Response;
-use crate::ffmpeg;
 use crate::ffmpeg::error::Error;
 use crate::ffmpeg::input::{Input, Stream};
-use crate::ffmpeg::packet::{ByteBuffer, Packet};
-use crate::gs::texture::Texture;
-use crate::player::cache::{Cache, CacheError};
+use crate::ffmpeg::packet::{Packet, PACKET_COUNTER};
+use crate::player::cache::{ByteBuffer, Cache, CacheReader, CacheWorker, CacheWorkerNotifier, SegmentView};
 use crate::player::decoder::DecodeWorkerMessage;
+use ffmpeg_sys_next::AV_NOPTS_VALUE;
+use std::collections::VecDeque;
+use std::mem::transmute;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{mpsc, Arc, RwLock, RwLockReadGuard};
+use std::thread::JoinHandle;
 
-/// Serves as a normal queue, with the only difference being that it counts the duration of packets from the lowest to the highest instead of just a number.
+/// Serves as a normal queue, with the only difference being that it counts the duration of packets from the lowest to the highest instead of just the packet count.
 #[derive(Clone)]
 pub struct PacketQueue {
     queue: VecDeque<Packet>,
@@ -126,9 +116,7 @@ impl PacketQueue {
         let pts = packet.pts();
         if pts != AV_NOPTS_VALUE {
             let pts = self.timebase * (pts as f64);
-            let begin = if self.view.is_initialized() && set_serial.is_none() {
-                None
-            } else { Some(pts) };
+            let begin = Some(pts).take_if(|_| !self.view.is_initialized() || set_serial.is_some());
             self.view.update(begin, Some(pts), set_serial);
         }
         self.queue.push_back(packet);
@@ -151,22 +139,19 @@ impl PacketQueue {
         self.view.queued()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.queue.capacity()
+    }
+
     pub fn close(&mut self) {
         self.view.closed.store(true, Ordering::SeqCst);
     }
 }
 
-pub type IoOrHttpError = (Option<reqwest::Error>, Option<io::Error>);
-
 pub enum InputWorkerMessage {
     End,
     Update,
     Job(InputReadJob),
-
-    HttpGetText(String, Sender<Result<String, reqwest::Error>>),
-    HttpGetDownload(String, String, Sender<Result<(), IoOrHttpError>>),
-    FileRead(String, Sender<Result<Vec<u8>, io::Error>>),
-    OpenInput(String, Vec<(String, String)>, Sender<Result<Input, Error>>)
 }
 
 pub enum InputCommand {
@@ -183,41 +168,20 @@ struct InputStreamEntry {
 
 enum JobInput {
     Input(Input),
-    Cache(Cache)
+    Cache(CacheReader, Option<CacheWorkerNotifier>)
 }
 
 impl JobInput {
 
-    fn serial(&self) -> u32 {
-        match self {
-            JobInput::Input(input) => input.serial,
-            JobInput::Cache(cache) => cache.serial
-        }
-    }
-
-    fn input(&self) -> &Input {
-        match self {
-            JobInput::Input(input) => input,
-            JobInput::Cache(cache) => &cache.input
-        }
-    }
-
-    fn has_error(&self) -> bool {
-        match self {
-            JobInput::Input(input) => input.read_error,
-            JobInput::Cache(cache) => cache.has_error()
-        }
-    }
-
     fn seek(&mut self, min: f64, time: f64, stream: Option<i32>) -> Result<(), Error> {
         match self {
             JobInput::Input(input) => input.seek(min, time, stream),
-            JobInput::Cache(cache) => match cache.seek(time) {
-                Ok(()) => Ok(()),
-                Err(error) => match error {
-                    CacheError::SourceReadError(error) => Err(error),
-                    _ => panic!("Cache seek error {:?}", error)
+            JobInput::Cache(cache, notifier) => {
+                cache.seek(time);
+                if let Some(notifier) = notifier {
+                    notifier.notify();
                 }
+                Ok(())
             }
         }
     }
@@ -250,44 +214,6 @@ impl InputReadJob {
         true
     }
 
-    pub fn can_cache(&self) -> bool {
-        if let JobInput::Cache(cache) = &self.input {
-            !cache.input.read_error
-        } else {
-            false
-        }
-    }
-
-    fn run_cache(&mut self) -> Result<(), CacheError> {
-        match &mut self.input {
-            JobInput::Input(_) => Ok(()),
-            JobInput::Cache(cache) => {
-                cache.write_next()
-            }
-        }
-    }
-
-    fn read_packet(&mut self) -> Result<Packet, Error> {
-        match &mut self.input {
-            JobInput::Input(input) => {
-                input.read_packet()
-            }
-            JobInput::Cache(cache) => {
-                let packet = cache.read_packet();
-                match packet {
-                    Ok(packet) => Ok(packet),
-                    Err(error) => {
-                        match error {
-                            CacheError::SourceReadError(error) => Err(error),
-                            CacheError::Eof => Err(Error::from_code(AVERROR_EOF)),
-                            _ => panic!("Cache error: {:?}", error)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     pub fn min_queued(&self) -> Option<f64> {
         let mut current = None;
         for entry in self.entries.iter()
@@ -313,6 +239,7 @@ impl InputReadJob {
 pub struct InputWorker {
     sender: Sender<InputWorkerMessage>,
     thread: Option<JoinHandle<()>>,
+    cache_worker: CacheWorker,
     pub passes: Arc<AtomicUsize>,
 }
 
@@ -373,7 +300,9 @@ impl InputWorkerContext {
             loop {
                 self.clear_inputs();
                 self.handle_input_commands();
-                if self.do_pass() && !self.handle_queued_messages() {
+                let queued = self.handle_queued_messages();
+                let pass = self.do_pass();
+                if pass && !queued {
                     break;
                 }
             }
@@ -415,98 +344,71 @@ impl InputWorkerContext {
                 self.inputs.push(job);
                 true
             }
-            InputWorkerMessage::HttpGetText(path, sender) => {
-                let client = self.get_http_client();
-                let result = client.get(&path).send()
-                    .map(|result| result.text().unwrap());
-                sender.send(result).unwrap();
-                true
-            }
-            InputWorkerMessage::HttpGetDownload(path, filepath, sender) => {
-                let client = self.get_http_client();
-                let result = client.get(&path).send();
-                if result.is_err() {
-                    sender.send(Err((result.err(), None))).unwrap();
-                    return true
-                }
-                let mut result = result.unwrap();
-                let path = Path::new(&path);
-
-                if let Some(parent) = path.parent() {
-                    let result = fs::create_dir_all(parent);
-                    if result.is_err() {
-                        sender.send(Err((None, result.err()))).unwrap();
-                    }
-                }
-
-                let file = File::create(filepath);
-                if file.is_err() {
-                    sender.send(Err((None, file.err()))).unwrap();
-                    return true
-                }
-                let mut file = BufWriter::new(file.unwrap());
-                result.copy_to(&mut file).unwrap();
-                sender.send(Ok(())).unwrap();
-                true
-            }
-            InputWorkerMessage::FileRead(path, sender) => {
-                let result = std::fs::read(path);
-                sender.send(result).unwrap();
-                true
-            }
-            InputWorkerMessage::OpenInput(path, options, sender) => {
-                let options = options.iter()
-                    .map(|(key, val)| (key.as_str(), val.as_str()))
-                    .collect::<Vec<_>>();
-                let input = Input::open(path.as_str(), &options);
-                sender.send(input).unwrap();
-                true
-            }
         }
     }
 
     fn do_pass(&mut self) -> bool {
         let mut available = self.inputs.iter_mut()
             .filter(|pair| pair.begin)
-            .filter(|pair| {
-                let has_error = pair.input.has_error();
-                if has_error {
-                    println!("Has Error")
+            .filter_map(|pair| {
+                let queue_has_space = pair.min_queued()
+                    .and_then(|q| Some(q < 5.0))
+                    .unwrap_or(true);
+                let should = match &mut pair.input {
+                    JobInput::Input(input) => {
+                        let serial = input.serial;
+                        let error = input.read_error;
+                        (queue_has_space || !pair.serial_matches(serial)) && !error
+                    }
+                    JobInput::Cache(cache, _) => {
+                        let sealed = cache.is_sealed();
+                        let duration = cache.cached_duration();
+                        let serial = cache.serial;
+                        let serial_matches = pair.serial_matches(serial);
+                        (queue_has_space || !serial_matches) && (duration >= 5.0 || (sealed && duration > 0.0))
+                    }
+                };
+                if should {
+                    Some(pair)
+                } else {
+                    None
                 }
-                !has_error
-            })
-            .filter(|pair| {
-                    let queue_has_space = pair.min_queued()
-                        .and_then(|q| Some(q < 5.0))
-                        .unwrap_or(true);
-                    let serial_changed = !pair.serial_matches(pair.input.serial());
-                    let can_cache = pair.can_cache();
-                    queue_has_space || serial_changed || can_cache
-                }).peekable();
+            }).peekable();
         let empty = available.peek().is_none();
         for pair in available {
-            if let Some(err) = pair.run_cache().err() {
-                match err {
-                    CacheError::SourceReadError(err) => println!("Source read error {:?}", err),
-                    _ => println!("Error while reading {:?}", err)
-                }
-            }
-            if !pair.min_queued()
+            let needs_input = pair.min_queued()
                 .and_then(|q| Some(q < 5.0))
-                .unwrap_or(true) {
-                continue;
-            }
-            match pair.read_packet() {
-                Ok(packet) => {
-                    if let Some(entry) = &pair.entries[packet.stream_index() as usize] {
-                        let mut queue = entry.queue.write().unwrap();
-                        self.passes.fetch_add(1, Ordering::Relaxed);
-                        queue.push(packet);
-                        entry.consumer_notifier.send(DecodeWorkerMessage::Wakeup).unwrap();
+                .unwrap_or(true);
+            match &mut pair.input {
+                JobInput::Input(input) => {
+                    match input.read_packet() {
+                        Ok(packet) => {
+                            if let Some(entry) = &pair.entries[packet.stream_index() as usize] {
+                                let mut queue = entry.queue.write().unwrap();
+                                queue.push(packet);
+                                entry.consumer_notifier.send(DecodeWorkerMessage::Wakeup).unwrap();
+                            }
+                        },
+                        Err(error) => {
+                            eprintln!("Read error: {:?}", error);
+                        }
                     }
-                },
-                Err(error) => {
-                    eprintln!("Read error: {:?}", error);
+                }
+                JobInput::Cache(cache, _) => {
+                    let packet = cache.read_packet();
+                    match packet {
+                        Ok(packet) => {
+                            if let Some(entry) = &pair.entries[packet.stream_index() as usize] {
+                                let mut queue = entry.queue.write().unwrap();
+                                queue.push(packet);
+                                println!("Queued: {:02.2} {:02} Total packets {:04}", queue.queued().unwrap_or(0.0), queue.capacity(), PACKET_COUNTER.load(Ordering::Relaxed));
+                                entry.consumer_notifier.send(DecodeWorkerMessage::Wakeup).unwrap();
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("Cache Read error: {:?}", err);
+                        }
+                    }
                 }
             }
         }
@@ -563,10 +465,23 @@ impl InputWorkerContext {
     }
 }
 
+pub struct InputWorkerNotifier {
+    sender: Sender<InputWorkerMessage>,
+}
+
+impl InputWorkerNotifier {
+
+    pub fn notify(&self) {
+        self.sender.send(InputWorkerMessage::Update).unwrap();
+    }
+
+}
+
 #[derive(Clone)]
 pub struct InputJobHandle {
     job_sender: Sender<InputCommand>,
     worker_sender: Sender<InputWorkerMessage>,
+    cache_views: Option<Arc<RwLock<Vec<SegmentView>>>>
 }
 
 impl InputJobHandle {
@@ -587,7 +502,10 @@ impl InputJobHandle {
         self.job_sender.send(InputCommand::Begin).unwrap();
         self.notify_worker();
     }
-    
+
+    pub fn cache_segments(&'_ self) -> Option<RwLockReadGuard<'_, Vec<SegmentView>>> {
+        self.cache_views.as_ref().and_then(|cache| cache.read().ok())
+    }
 }
 
 impl InputWorker {
@@ -612,19 +530,23 @@ impl InputWorker {
             thread,
             sender,
             passes,
+            cache_worker: CacheWorker::new()
         }
     }
 
-    pub fn get_sender(&self) -> Sender<InputWorkerMessage> {
-        self.sender.clone()
+    pub fn notifier(&self) -> InputWorkerNotifier {
+        InputWorkerNotifier {
+            sender: self.sender.clone(),
+        }
     }
-
-    pub fn add_input(&mut self, input: Input) -> InputJobHandle {
+    
+    pub fn add_pre_cached(&mut self, cache: CacheReader) -> InputJobHandle {
         let (sender, receiver) = mpsc::channel::<InputCommand>();
 
-        let queue = (0..input.streams.len()).map(|_| None).collect();
+        let queue = (0..cache.streams.len()).map(|_| None).collect();
+        let views = cache.segment_views.clone();
         let job = InputReadJob {
-            input: JobInput::Cache(Cache::new("test.bin", input)),
+            input: JobInput::Cache(cache, None),
             entries: queue,
             receiver,
             begin: false
@@ -633,31 +555,35 @@ impl InputWorker {
         worker_sender.send(InputWorkerMessage::Job(job)).unwrap();
         InputJobHandle {
             job_sender: sender,
-            worker_sender
+            worker_sender,
+            cache_views: Some(views)
         }
     }
 
-    pub fn add_http_get_text(&mut self, path: String) -> TaskHandle<String, reqwest::Error> {
-        let (handler, cancel, sender) = TaskHandle::new();
-        self.sender.send(InputWorkerMessage::HttpGetText(path, sender)).unwrap();
-        handler
-    }
-    
-    pub fn add_open_input(&mut self, path: String, options: Vec<(String, String)>) -> TaskHandle<Input, Error> {
-        let (handler, cancel, sender) = TaskHandle::new();
-        self.sender.send(InputWorkerMessage::OpenInput(path, options, sender)).unwrap();
-        handler
-    }
+    pub fn add_input<P: AsRef<Path>>(&mut self, input: Input, cache_path: Option<P>) -> InputJobHandle {
+        let (sender, receiver) = mpsc::channel::<InputCommand>();
 
-    pub fn add_http_get_download(&mut self, url: String, path: String) -> Receiver<Result<(), IoOrHttpError>> {
-        let (sender, receiver) = mpsc::channel();
-        self.sender.send(InputWorkerMessage::HttpGetDownload(url, path, sender)).unwrap();
-        receiver
-    }
-
-    pub fn add_file_read(&mut self, path: String) -> Receiver<Result<Vec<u8>, io::Error>> {
-        let (sender, receiver) = mpsc::channel();
-        self.sender.send(InputWorkerMessage::FileRead(path, sender)).unwrap();
-        receiver
+        let queue = (0..input.streams.len()).map(|_| None).collect();
+        let (input, views) = if let Some(path) = cache_path {
+            let cache = Cache::new(path, input);
+            let views = cache.views();
+            let (cache, notifier) = self.cache_worker.push(cache, self.notifier());
+            (JobInput::Cache(cache, Some(notifier)), Some(views))
+        } else {
+            (JobInput::Input(input), None)
+        };
+        let job = InputReadJob {
+            input,
+            entries: queue,
+            receiver,
+            begin: false
+        };
+        let worker_sender = self.sender.clone();
+        worker_sender.send(InputWorkerMessage::Job(job)).unwrap();
+        InputJobHandle {
+            job_sender: sender,
+            worker_sender,
+            cache_views: views
+        }
     }
 }
