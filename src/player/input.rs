@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, RwLock, RwLockReadGuard};
 use std::thread::JoinHandle;
+use crate::player::clock::AtomicF64;
 
 /// Serves as a normal queue, with the only difference being that it counts the duration of packets from the lowest to the highest instead of just the packet count.
 #[derive(Clone)]
@@ -22,10 +23,9 @@ pub struct PacketQueue {
 
 #[derive(Clone)]
 pub struct PacketQueueView {
-    initialized: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
-    begin_pts: Arc<AtomicU64>,
-    end_pts: Arc<AtomicU64>,
+    begin_pts: Arc<AtomicF64>,
+    end_pts: Arc<AtomicF64>,
     serial: Arc<AtomicU32>,
 }
 
@@ -33,10 +33,9 @@ impl PacketQueueView {
 
     fn new() -> PacketQueueView {
         PacketQueueView {
-            initialized: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
-            begin_pts: Arc::new(AtomicU64::new(0)),
-            end_pts: Arc::new(AtomicU64::new(0)),
+            begin_pts: Arc::new(AtomicF64::empty()),
+            end_pts: Arc::new(AtomicF64::empty()),
             serial: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -46,13 +45,9 @@ impl PacketQueueView {
     }
 
     pub fn queued(&self) -> Option<f64> {
-        if self.is_initialized() {
-            let begin: f64 = unsafe { transmute(self.begin_pts.load(Ordering::SeqCst)) };
-            let end: f64 = unsafe { transmute(self.end_pts.load(Ordering::SeqCst)) };
-            Some(end - begin)
-        } else {
-            None
-        }
+        let begin: f64 = self.begin_pts.load(Ordering::SeqCst);
+        let end: f64 = self.end_pts.load(Ordering::SeqCst);
+        Some(end - begin).take_if(|d| !d.is_nan())
     }
 
     pub fn serial(&self) -> Option<u32> {
@@ -64,18 +59,15 @@ impl PacketQueueView {
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.initialized.load(Ordering::SeqCst)
+        !self.begin_pts.is_empty(Ordering::SeqCst) && !self.end_pts.is_empty(Ordering::SeqCst)
     }
 
     fn update(&self, begin: Option<f64>, end: Option<f64>, serial: Option<u32>) {
-        if !self.is_initialized() {
-            self.initialized.store(true, Ordering::SeqCst);
-        }
         if let Some(begin) = begin {
-            self.begin_pts.store(unsafe { transmute(begin) }, Ordering::SeqCst);
+            self.begin_pts.store(begin, Ordering::SeqCst);
         }
         if let Some(end) = end {
-            self.end_pts.store(unsafe { transmute(end) }, Ordering::SeqCst);
+            self.end_pts.store(end, Ordering::SeqCst);
         }
         if let Some(serial) = serial {
             self.serial.store(serial, Ordering::SeqCst);
@@ -103,16 +95,11 @@ impl PacketQueue {
     
     pub fn push(&mut self, packet: Packet) {
         let serial = self.view.serial();
-        let set_serial = if let Some(serial) = serial {
-            if serial != packet.serial {
-                self.queue.clear();
-                Some(packet.serial)
-            } else {
-                None
-            }
-        } else {
-            Some(packet.serial)
-        };
+        let set_serial = Some(packet.serial)
+            .take_if(|s| Some(*s) != serial);
+        if set_serial.is_some() {
+            self.queue.clear();
+        }
         let pts = packet.pts();
         if pts != AV_NOPTS_VALUE {
             let pts = self.timebase * (pts as f64);
@@ -401,7 +388,6 @@ impl InputWorkerContext {
                             if let Some(entry) = &pair.entries[packet.stream_index() as usize] {
                                 let mut queue = entry.queue.write().unwrap();
                                 queue.push(packet);
-                                println!("Queued: {:02.2} {:02} Total packets {:04}", queue.queued().unwrap_or(0.0), queue.capacity(), PACKET_COUNTER.load(Ordering::Relaxed));
                                 entry.consumer_notifier.send(DecodeWorkerMessage::Wakeup).unwrap();
                             }
                         }

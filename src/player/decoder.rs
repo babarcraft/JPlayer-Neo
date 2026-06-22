@@ -39,6 +39,7 @@ pub struct AudioRingBuffer {
 pub struct AudioRingView {
     size: Arc<AtomicUsize>,
     seek_avoid_serial: Arc<AtomicU32>,
+    seek_flag: Arc<AtomicBool>,
     seek: Arc<AtomicF64>,
     serial: Arc<AtomicU32>,
     closed: Arc<AtomicBool>,
@@ -67,10 +68,13 @@ impl AudioRingView {
     }
 
     pub fn check_seek_and_clear(&self, frame: &Frame) -> bool {
+        if !self.seek_flag.load(Ordering::SeqCst) {
+            return false;
+        }
         let seek = self.seek.load(Ordering::SeqCst);
         let avoid_serial = self.seek_avoid_serial.load(Ordering::SeqCst);
         let avoid = Some(avoid_serial) == frame.serial;
-        if seek <= 0f64 && !avoid {
+        if seek.is_nan() && !avoid {
             return false;
         }
         let pts = frame.pts.unwrap_or(0.0);
@@ -78,8 +82,8 @@ impl AudioRingView {
         if seek > pts + duration || avoid {
             true
         } else {
-            self.seek.store(-1.0, Ordering::SeqCst);
-            self.seek_avoid_serial.store(0, Ordering::SeqCst);
+            self.seek.set_empty(Ordering::SeqCst);
+            self.seek_flag.store(false, Ordering::SeqCst);
             false
         }
     }
@@ -100,6 +104,7 @@ impl AudioRingBuffer {
             view: AudioRingView {
                 serial: Arc::new(AtomicU32::new(0)),
                 size: Arc::new(AtomicUsize::new(0)),
+                seek_flag: Arc::new(AtomicBool::new(false)),
                 seek: seek.clone(),
                 closed: Arc::new(AtomicBool::new(false)),
                 seek_avoid_serial: seek_avoid_serial.clone(),
@@ -107,7 +112,7 @@ impl AudioRingBuffer {
             },
 
             samples_read: Arc::new(AtomicUsize::new(0)),
-            pts: Arc::new(AtomicF64::new(0.0)),
+            pts: Arc::new(AtomicF64::empty()),
             last_read: Arc::new(AtomicInstant::now()),
             seek_avoid_serial,
             seek,
@@ -131,12 +136,12 @@ impl AudioRingBuffer {
 
     pub fn read_to(&mut self, dest: &mut [i16]) -> usize {
         let to_copy = dest.len().min(self.view.size());
-        self.samples_read.fetch_add(to_copy, Ordering::SeqCst);
-        self.last_read.set_now(Ordering::SeqCst);
         for i in 0..to_copy {
             dest[i] = self.buffer[self.read_index];
             self.read_index = (self.read_index + 1) % self.buffer.len();
         }
+        self.samples_read.fetch_add(to_copy, Ordering::SeqCst);
+        self.last_read.set_now(Ordering::SeqCst);
         self.view.size.fetch_sub(to_copy, Ordering::SeqCst);
         to_copy
     }
@@ -149,34 +154,22 @@ impl AudioRingBuffer {
         self.write_index = 0;
     }
 
-    pub fn write_from(&mut self, src: &[i16], pts: f64, serial: u32) -> usize {
+    pub fn write_from(&mut self, src: &[i16], pts: Option<f64>, serial: u32) -> usize {
         let current_serial = self.view.serial();
         if current_serial != serial {
             self.view.serial.store(serial, Ordering::SeqCst);
-            self.pts.store(pts, Ordering::SeqCst);
             self.clear();
         }
 
-        let to_copy = src.len().min(self.remaining_space());
-        let mut offset = 0usize;
-
-        let time = to_copy as f64 / (self.sample_rate as f64 * self.channels as f64);
-        let seek: f64 = self.seek.load(Ordering::SeqCst);
-        if seek >= 0.0 {
-            if pts < seek && pts + time < seek || self.seek_avoid_serial.load(Ordering::SeqCst) == current_serial {
-                self.clear();
-                self.skips += 1;
-                return to_copy;
-            } else {
-                let offset_time = pts + time - seek;
-                offset = (offset_time * self.sample_rate as f64 * self.channels as f64) as usize;
-                self.seek.store(-1.0f64, Ordering::SeqCst);
-                self.seek_avoid_serial.store(0, Ordering::SeqCst);
-                self.skips = 0;
+        if let Some(pts) = pts {
+            if self.pts.is_empty(Ordering::SeqCst) || current_serial != serial {
+                self.pts.store(pts, Ordering::SeqCst);
             }
         }
 
-        for i in offset..to_copy {
+        let to_copy = src.len().min(self.remaining_space());
+
+        for i in 0..to_copy {
             self.buffer[self.write_index] = src[i];
             self.write_index = (self.write_index + 1) % self.buffer.len();
         }
@@ -200,6 +193,7 @@ impl AudioRingBuffer {
             last_read: self.last_read.clone(),
             closed: self.view.closed.clone(),
             seek_avoid_serial: self.seek_avoid_serial.clone(),
+            seek_flag: self.view.seek_flag.clone(),
             seek: self.seek.clone(),
             sample_rate: self.sample_rate,
             channels: self.channels,
@@ -214,6 +208,7 @@ pub struct AudioRingClock {
     last_read: Arc<AtomicInstant>,
     closed: Arc<AtomicBool>,
     seek_avoid_serial: Arc<AtomicU32>,
+    seek_flag: Arc<AtomicBool>,
     seek: Arc<AtomicF64>,
     sample_rate: u32,
     channels: u16,
@@ -240,6 +235,7 @@ impl Clock for AudioRingClock {
     fn set_seek_flag(&self, seek: f64) {
         self.seek_avoid_serial.store(self.serial.load(Ordering::SeqCst), Ordering::SeqCst);
         self.seek.store(seek, Ordering::SeqCst);
+        self.seek_flag.store(true, Ordering::SeqCst);
     }
 
     fn is_ext(&self) -> bool {
@@ -288,7 +284,58 @@ pub enum DecodeWorkerMessage {
     Job(DecodeJob)
 }
 
-pub struct DecodeJob {
+#[derive(Clone)]
+pub struct SeekFlag {
+    flag: Arc<AtomicBool>,
+    seek_pts: Arc<AtomicF64>,
+    seek_avoid_serial: Arc<AtomicU32>,
+}
+
+impl SeekFlag {
+
+    fn new() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            seek_pts: Arc::new(AtomicF64::empty()),
+            seek_avoid_serial: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn has_flag(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    fn check_frame(&self, frame: &Frame) -> bool {
+        if !self.flag.load(Ordering::SeqCst) || frame.pts.is_none() {
+            return false;
+        }
+
+        let pts = frame.pts.unwrap();
+        let avoid = self.seek_avoid_serial.load(Ordering::SeqCst);
+        let seek = self.seek_pts.load(Ordering::SeqCst);
+        if Some(avoid) == frame.serial { return true }
+        if seek.is_nan() { return false; }
+
+        let late = pts < seek;
+        if !late {
+            self.flag.store(false, Ordering::SeqCst);
+            self.seek_pts.set_empty(Ordering::SeqCst);
+        }
+
+        late
+    }
+
+    pub fn set_seek(&self, pts: f64, serial: u32) {
+        self.seek_avoid_serial.store(serial, Ordering::SeqCst);
+        self.seek_pts.store(pts, Ordering::SeqCst);
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+}
+
+struct DecodeJob {
+    seek_flag: SeekFlag,
+
     decoder: Decoder,
     packet_queue: Arc<RwLock<PacketQueue>>,
     packet_queue_view: PacketQueueView,
@@ -302,13 +349,31 @@ pub struct DecodeJob {
     needs_input: bool
 }
 
+#[derive(Clone)]
+pub struct DecodeJobHandle {
+    worker_sender: Sender<DecodeWorkerMessage>,
+    seek_flag: SeekFlag,
+}
+
+impl DecodeJobHandle {
+
+    pub fn notify_worker(&self) {
+        self.worker_sender.send(DecodeWorkerMessage::Wakeup).unwrap();
+    }
+
+    pub fn set_seek(&self, pts: f64, serial: u32) {
+        self.seek_flag.set_seek(pts, serial);
+    }
+
+}
+
 impl DecodeJob {
     pub fn consumer_has_space_and_serial(&self, serial: Option<u32>) -> bool {
         match &self.frame_consumer {
             FrameConsumer::AudioConsumer(ring, view) => {
                 let remaining_space = view.remaining();
                 if let Some(frame) = self.audio_frame.as_ref() {
-                    if remaining_space >= self.audio_frame_remaining || frame.serial != serial || view.has_seek() {
+                    if remaining_space >= self.audio_frame_remaining || frame.serial != serial {
                         true
                     } else {
                         false
@@ -318,7 +383,7 @@ impl DecodeJob {
                 }
             },
             FrameConsumer::VideoConsumer(queue, view) => {
-                if Some(view.serial()) != serial || view.has_seek() {
+                if Some(view.serial()) != serial {
                     return true
                 }
                 view.remaining_space() > 0
@@ -329,9 +394,6 @@ impl DecodeJob {
     pub fn write_received(&mut self) {
         match &mut self.frame_consumer {
             FrameConsumer::AudioConsumer(ring, view) => {
-                if view.check_seek_and_clear(&self.frame) {
-                    return;
-                }
                 let (sample_rate, channels) = self.audio_config.unwrap();
                 let audio_frame = self.audio_frame.get_or_insert_with(|| AudioFrame::new());
                 let context = self.audio_converter.get_or_insert_with(|| AudioConverter::new(
@@ -343,18 +405,21 @@ impl DecodeJob {
                     self.frame.sample_format().unwrap()
                 ).unwrap());
                 context.convert_frame(&self.frame, audio_frame).unwrap();
+                self.frame.unref();
                 self.audio_frame_remaining = audio_frame.num_samples;
 
                 if self.audio_frame_remaining > 0 {
                     let mut ring = ring.write().unwrap();
                     let plane = audio_frame.plane(0);
-                    self.audio_frame_remaining -= ring.write_from(&plane[..self.audio_frame_remaining], self.frame.pts.unwrap(), self.frame.serial.unwrap())
+                    self.audio_frame_remaining -= ring.write_from(
+                        &plane[..self.audio_frame_remaining],
+                        self.frame.pts,
+                        self.frame.serial.unwrap()
+                    )
                 }
+                self.frame.unref();
             }
             FrameConsumer::VideoConsumer(queue, view) => {
-                if view.check_seek_and_clear(&self.frame) {
-                    return;
-                }
                 let mut queue = queue.write().unwrap();
                 if let Some(dest) = queue.peek_write(self.frame.serial.unwrap()) {
                     if self.decoder.is_hardware {
@@ -363,8 +428,8 @@ impl DecodeJob {
                         self.frame.move_to(dest)
                     }
                     queue.push();
-                } else {
                 }
+                self.frame.unref();
             }
         }
     }
@@ -373,10 +438,7 @@ impl DecodeJob {
     pub fn write_remaining(&mut self) -> bool {
         match &mut self.frame_consumer {
             FrameConsumer::AudioConsumer(ring, view) => {
-                if view.has_seek() {
-                    self.audio_frame_remaining = 0;
-                    return false;
-                }
+                if self.seek_flag.has_flag() { self.audio_frame_remaining = 0; }
                 if self.audio_frame_remaining == 0 {
                     return false;
                 }
@@ -385,7 +447,7 @@ impl DecodeJob {
                 let plane = audio_frame.plane(0);
                 let begin_index = plane.len() - self.audio_frame_remaining;
                 let end_index = begin_index + self.audio_frame_remaining;
-                self.audio_frame_remaining -= ring.write_from(&plane[begin_index..end_index], audio_frame.pts.unwrap(), audio_frame.serial.unwrap());
+                self.audio_frame_remaining -= ring.write_from(&plane[begin_index..end_index], None, audio_frame.serial.unwrap());
                 self.audio_frame_remaining > 0
             }
             FrameConsumer::VideoConsumer(queue, view) => {
@@ -419,6 +481,9 @@ impl DecodeWorkerContext {
     fn do_pass(&mut self) -> bool {
         let mut available = self.jobs.iter_mut()
             .filter(|job| {
+                if job.seek_flag.has_flag() {
+                    return true;
+                }
                 let view = &job.packet_queue_view;
                 let frame_queue_space = job.consumer_has_space_and_serial(view.serial());
                 let packet_queue_space = view.queued().unwrap_or(0.0);
@@ -432,7 +497,7 @@ impl DecodeWorkerContext {
         let empty = available.peek().is_none();
         for job in available {
             self.passes.fetch_add(1, Ordering::Relaxed);
-            while job.write_remaining() {
+            if job.write_remaining() && !job.seek_flag.has_flag() {
                 continue;
             }
             match job.decoder.receive_frame(&mut job.frame) {
@@ -440,13 +505,16 @@ impl DecodeWorkerContext {
                     println!("Error decoding frame: {:?}", error);
                 },
                 DecoderResult::FrameReceived => {
-                    job.write_received();
+                    if !job.seek_flag.check_frame(&job.frame) {
+                        job.write_received();
+                    }
                 }
                 DecoderResult::NeedsInput => {
                     if job.packet_queue_view.queued().unwrap_or(0.0) < 5.0 {
                         job.input_handle.notify_worker();
                     }
-                    if let Some(packet) = job.packet_queue.write().unwrap().pop() {
+                    let mut queue = job.packet_queue.write().unwrap();
+                    if let Some(packet) = queue.pop() {
                         match job.decoder.send_packet(&packet) {
                             Err(e) => {
                                 job.decoder.flush();
@@ -544,9 +612,11 @@ impl DecodeWorker {
         self.sender.clone()
     }
 
-    pub fn add_decode_job(&mut self, stream: &Stream, audio_config: Option<(u32, u16)>, input_job_handle: &InputJobHandle) -> (FrameConsumer, Sender<DecodeWorkerMessage>) {
+    pub fn add_decode_job(&mut self, stream: &Stream, audio_config: Option<(u32, u16)>, input_job_handle: &InputJobHandle) -> (FrameConsumer, DecodeJobHandle) {
         let queue = Arc::new(RwLock::new(PacketQueue::new(stream)));
         let sender = self.sender.clone();
+        let decoder = Decoder::new(stream, &[]).unwrap();
+        let seek_flag = SeekFlag::new();
         let job = match stream.stream_type {
             StreamType::Audio => {
                 let (sample_rate, channels) = audio_config.expect("Missing audio config");
@@ -555,9 +625,10 @@ impl DecodeWorker {
                 let frame_queue = AudioConsumer(Arc::new(RwLock::new(ring)), view);
                 let packet_queue_view = queue.read().unwrap().view();
                 DecodeJob {
-                    decoder: Decoder::new(stream, &[]).unwrap(),
+                    decoder,
                     packet_queue: queue,
                     input_handle: input_job_handle.clone(),
+                    seek_flag: seek_flag.clone(),
                     packet_queue_view,
                     frame: Frame::new(),
                     frame_consumer: frame_queue,
@@ -574,9 +645,10 @@ impl DecodeWorker {
                 let frame_queue = VideoConsumer(Arc::new(RwLock::new(frame_queue)), view);
                 let packet_queue_view = queue.read().unwrap().view();
                 DecodeJob {
-                    decoder: Decoder::new(stream, &[]).unwrap(),
+                    decoder,
                     packet_queue: queue,
                     input_handle: input_job_handle.clone(),
+                    seek_flag: seek_flag.clone(),
                     packet_queue_view,
                     frame: Frame::new(),
                     frame_consumer: frame_queue,
@@ -593,6 +665,9 @@ impl DecodeWorker {
         input_job_handle.attach_queue(stream, queue, sender.clone());
         let consumer = job.frame_consumer.clone();
         sender.send(DecodeWorkerMessage::Job(job)).unwrap();
-        (consumer, sender)
+        (consumer, DecodeJobHandle {
+            worker_sender: sender,
+            seek_flag,
+        })
     }
 }

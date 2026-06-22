@@ -681,7 +681,7 @@ struct Segment {
 
 impl Segment {
 
-    fn new(mut file: CacheFile, stream_meta_data: Vec<StreamMetaData>) -> Self {
+    fn new(file: CacheFile, stream_meta_data: Vec<StreamMetaData>) -> Self {
         let preferred_stream = stream_meta_data.iter()
             .find(|str| str.stream_type == StreamType::Video)
             .map(|str| str.index);
@@ -1449,7 +1449,6 @@ impl CacheReader {
             if self.file.read_index >= self.file.write_index.load(Ordering::SeqCst) {
                 return Err(CacheError::Eof)
             }
-            println!("Capacity: {:09} {:09}", self.buffer.capacity(), self.file.buffer.capacity());
             self.buffer.clear();
             self.file.read_packet(&mut self.buffer).map_err(CacheError::ReadError)?;
             let line: SegmentLine = self.buffer.read_ser()

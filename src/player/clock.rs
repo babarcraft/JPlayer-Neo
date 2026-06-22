@@ -8,6 +8,18 @@ impl AtomicF64 {
     pub fn new(v: f64) -> Self {
         AtomicF64(AtomicU64::new(v.to_bits()))
     }
+    
+    pub fn empty() -> Self {
+        AtomicF64::new(f64::NAN)
+    }
+    
+    pub fn is_empty(&self, ordering: Ordering) -> bool {
+        self.load(ordering).is_nan()
+    }
+    
+    pub fn set_empty(&self, ordering: Ordering) {
+        self.store(f64::NAN, ordering);
+    }
 
     pub fn load(&self, ordering: Ordering) -> f64 {
         f64::from_bits(self.0.load(ordering))

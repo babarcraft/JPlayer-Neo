@@ -6,13 +6,13 @@ use cpal::{BufferSize, ChannelCount, Device, Host, SampleFormat, Stream, StreamC
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ffmpeg_sys_next::{av_ripemd_init, AVSampleFormat};
 use crate::ffmpeg::frame::SampleType;
-use crate::player::decoder::{AudioRingBuffer, DecodeWorkerMessage};
+use crate::player::decoder::{AudioRingBuffer, DecodeJobHandle, DecodeWorkerMessage};
 
 pub struct AudioDevice {
     host: Host,
     device: Device,
     stream: Stream,
-    sender: Sender<DecodeWorkerMessage>,
+    handle: DecodeJobHandle,
     playing: Arc<AtomicBool>,
     pub volume: Arc<AtomicI16>,
     pub ring_buffer: Arc<RwLock<AudioRingBuffer>>,
@@ -20,7 +20,7 @@ pub struct AudioDevice {
 
 impl AudioDevice {
 
-    pub fn default_device(ring_buffer: Arc<RwLock<AudioRingBuffer>>, sender: Sender<DecodeWorkerMessage>) -> Result<AudioDevice, String> {
+    pub fn default_device(ring_buffer: Arc<RwLock<AudioRingBuffer>>, handle: DecodeJobHandle) -> Result<AudioDevice, String> {
         let host = cpal::default_host();
         let device = host.default_output_device().unwrap();
 
@@ -43,7 +43,7 @@ impl AudioDevice {
         let stream = {
             let ring_buffer = ring_buffer.clone();
             let view = ring_buffer.read().unwrap().view();
-            let sender = sender.clone();
+            let handle = handle.clone();
             let playing = playing.clone();
             let volume = volume.clone();
             device.build_output_stream(&config, move |output: &mut [i16], info: &cpal::OutputCallbackInfo| {
@@ -62,7 +62,7 @@ impl AudioDevice {
                 }
 
                 if playing {
-                    sender.send(DecodeWorkerMessage::Wakeup).unwrap();
+                    handle.notify_worker();
                 }
             }, move |error| {}, None).unwrap()
         };
@@ -75,7 +75,7 @@ impl AudioDevice {
             playing,
             stream,
             volume,
-            sender,
+            handle,
             ring_buffer
         })
     }
@@ -98,7 +98,7 @@ impl AudioDevice {
 impl Drop for AudioDevice {
     fn drop(&mut self) {
         self.ring_buffer.write().unwrap().close();
-        self.sender.send(DecodeWorkerMessage::Wakeup).unwrap();
+        self.handle.notify_worker();
         self.stream.pause().unwrap();
     }
 }

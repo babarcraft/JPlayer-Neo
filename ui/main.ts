@@ -229,7 +229,7 @@ class PlayerScene extends Root {
         this.surface = surface;
         this.controls = controls
         controls.input.onEnterPressed = () => {
-            this.player = ui.newVideoPlayer(controls.input.text.text, "input", surface.surface, inputWorker, decodeWorker)
+            this.player = ui.newVideoPlayer(controls.input.text.text, "precached", surface.surface, inputWorker, decodeWorker)
             this.player.volume = 0.0;
             this.player.play();
             controls.player = this.player

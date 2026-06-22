@@ -113,7 +113,9 @@ impl FrameQueue {
             return None;
         }
 
-        Some(&mut self.frames[self.write_index])
+        let frame = &mut self.frames[self.write_index];
+        frame.unref();
+        Some(frame)
     }
 
     fn check_and_update_serial(&mut self, frame_serial: u32) {
@@ -170,6 +172,8 @@ impl FrameQueue {
     }
 
     pub fn pop(&mut self) {
+        let frame = &mut self.frames[self.read_index];
+        frame.unref();
         self.read_index = (self.read_index + 1) % self.frames.len();
         self.view.size.fetch_sub(1, Ordering::SeqCst);
     }
@@ -372,14 +376,12 @@ impl VideoSurface {
 
     pub fn upload(&mut self, frame: &Frame, plane_formats: &[InternalFormat], chroma: Option<usize>) {
         if !self.can_upload() {
-            println!("Dropped frame boy!");
             return;
         }
 
         {
             let slot = &mut self.upload_slots[self.write_index as usize];
             if !slot.fence.check_done(None) {
-                println!("Dropped frame boy!");
                 return;
             }
             slot.upload(frame, plane_formats, chroma);

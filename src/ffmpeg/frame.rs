@@ -92,7 +92,8 @@ impl Frame {
 
     pub fn sample_format(&self) -> Option<AVSampleFormat> {
         unsafe {
-            std::mem::transmute((*self.pointer).format)
+            let format: AVSampleFormat = std::mem::transmute((*self.pointer).format);
+            Some(format)
         }
     }
 
@@ -242,10 +243,48 @@ pub enum SampleType {
 }
 
 #[derive(Debug)]
+pub struct Buffer {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl Buffer {
+    pub fn new(len: usize) -> Buffer {
+        unsafe {
+            Buffer {
+                ptr: av_malloc(len) as *mut u8,
+                len,
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn slice<T: Sized>(&self) -> &[T] {
+        unsafe {
+            std::slice::from_raw_parts(self.ptr as *const T, self.len / size_of::<T>())
+        }
+    }
+
+    pub fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        unsafe {
+            av_free(self.ptr as *mut c_void);
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct AudioFrame {
-    pub planes: [*mut u8; 8],
-    pub plane_sizes: [Option<usize>; 8],
-    pub num_planes: usize,
+    pub planes: Vec<Buffer>,
+    pub plane_sizes: usize,
     pub channels: usize,
     pub sample_rate: u32,
     pub sample_type: SampleType,
@@ -261,13 +300,12 @@ unsafe impl Sync for AudioFrame {}
 impl AudioFrame {
     pub fn new() -> Self {
         Self {
-            planes: [const { null_mut() }; 8],
-            plane_sizes: [const { None }; 8],
-            num_planes: 0,
+            planes: Vec::new(),
             sample_type: Float,
             channels: 0,
             sample_rate: 0,
             num_samples: 0,
+            plane_sizes: 0,
             pts: None,
             duration: None,
             serial: None
@@ -275,47 +313,24 @@ impl AudioFrame {
     }
 
     pub fn plane<T>(&self, num: usize) -> &[T] {
-        unsafe {
-            let actual = (self.num_samples * self.channels) / self.num_planes.max(1);
-            std::slice::from_raw_parts(self.planes[num] as *const T, actual)
+        self.planes[num].slice()
+    }
+
+    pub fn ensure_allocated(&mut self, size: usize, plane_num: usize) {
+        if self.plane_sizes < size || plane_num > self.planes.len() {
+            self.planes.clear();
+            for _ in 0..plane_num {
+                self.planes.push(Buffer::new(size));
+            }
+            self.plane_sizes = size;
         }
     }
 
-    pub fn ensure_allocated(&mut self, plane_size: usize, planes: usize) {
-        for index in 0..planes {
-            if let Some(size) = &mut self.plane_sizes[index] {
-                if *size != plane_size {
-                    self.planes[index] = unsafe {
-                        av_malloc(plane_size) as *mut u8
-                    };
-                    *size = plane_size;
-                }
-            } else {
-                self.planes[index] = unsafe {
-                    av_malloc(plane_size) as *mut u8
-                };
-                self.plane_sizes[index] = Some(plane_size);
-            }
+    pub fn get_planes(&self) -> [*mut u8; 8] {
+        let mut planes: [*mut u8; 8] = [const { null_mut() }; 8];
+        for (i, ptr) in self.planes.iter().enumerate() {
+            planes[i] = ptr.ptr;
         }
-        for i in planes..planes.max(self.num_planes) {
-            let plane_ptr = &mut self.planes[i];
-            if !plane_ptr.is_null() {
-                unsafe {
-                    av_free(*plane_ptr as *mut c_void);
-                }
-                *plane_ptr = null_mut();
-            }
-        }
-        self.num_planes = planes;
-    }
-}
-
-impl Drop for AudioFrame {
-    fn drop(&mut self) {
-        for plane in &self.planes[0..self.num_planes] {
-            unsafe {
-                av_free(*plane as *mut c_void);
-            }
-        }
+        planes
     }
 }

@@ -109,6 +109,7 @@ impl Decoder {
     }
 
     pub fn receive_frame(&mut self, frame: &mut Frame) -> DecoderResult {
+        frame.unref();
         frame.receive_frame_from_decoder(self.serial, self.timebase, self.context)
     }
 
@@ -253,10 +254,11 @@ impl AudioConverter {
             dest.ensure_allocated(bytes_per_plane, planes);
 
             let src = (*frame.pointer).data.as_ptr() as *const *const u8;
+            let dest_planes = dest.get_planes();
 
             let result = swr_convert(
                 self.context,
-                dest.planes.as_mut_ptr(),
+                dest_planes.as_ptr(),
                 max_out_samples,
                 src,
                 in_samples,
@@ -306,10 +308,11 @@ impl AudioConverter {
             };
 
             dest.ensure_allocated(bytes_per_plane, planes);
+            let dest_planes = dest.get_planes();
 
             let result = swr_convert(
                 self.context,
-                dest.planes.as_mut_ptr(),
+                dest_planes.as_ptr(),
                 max_out_samples,
                 std::ptr::null(),
                 0,
